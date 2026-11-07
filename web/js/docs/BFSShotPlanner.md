@@ -370,7 +370,8 @@ Connect a vision-language model to the planner's `vlm` input (CLIPLoader with `q
 It looks at a few frames of every shot and suggests what to segment, a description of the shot (camera,
 framing, action) and whether to run it. In the **Prompts & refs** tab: *Use the VLM when the workflow runs* applies the
 suggestions at run time (mask text for shots without one; `{shot}` in a prompt becomes that shot's
-description), *Analyse shots* asks from the panel (after one run with the VLM connected), and each shot's
+description), *Analyse shots* asks from the panel (no run needed: the first click loads the VLM from the loader wired to
+the `vlm` input), and each shot's
 editor shows its suggestion with buttons to apply it. The summary output lists them too.
 
 ## Describe references ({details})
@@ -478,8 +479,8 @@ marker, with a blank in its place (e.g. `<Subject 1> is the ___ shown in <Pictur
 it, so the description adapts to the prompt and not the other way round (no "the A goblin", no paragraph inside a
 sentence). The panel buttons use the global prompt (or the shot's own); at run time the prompt the shot really uses.
 
-The VLM buttons in the panel work after the workflow has run once with the VLM connected (ComfyUI only hands
-models to nodes when they run). Tested with Qwen3-VL 8B; some smaller or modified models return empty answers
+The VLM buttons in the panel load the VLM from the loader wired to the `vlm` input the first time you click one (no
+run needed; see *What you need* under Describe target). Tested with Qwen3-VL 8B; some smaller or modified models return empty answers
 for some wordings: the planner retries with a reworded request and with sampling, but if a preset stays empty,
 use the 8B or another preset.
 
@@ -664,8 +665,11 @@ VLM, so it works for anyone or anything you can click on.
 ### What you need
 
 - The planner's **`vlm`** input connected to a Qwen3-VL (CLIPLoader, type *stable_diffusion*, `qwen3vl_8b` recommended).
-- The workflow run **once** with it connected. ComfyUI only hands models to nodes when they run; after that the
-  panel buttons can use it.
+- No run needed: the first VLM button you click (Describe target, Describe pictures, Write prompts, Analyse shots)
+  loads the model from the loader wired to the `vlm` input, which takes a moment. After a run, the panel uses the
+  VLM the planner received instead, until the next run (so a loader changed after a run takes effect at the next
+  run, or after a ComfyUI restart). A loader the panel cannot run by itself (its own inputs linked to other nodes,
+  or not a plain loader) still needs one run.
 - Without a VLM it still works: you get the cut-out and type the description yourself.
 
 ### 1. Put `{target}` in the prompt
@@ -749,7 +753,7 @@ or *Crop + mask*.
 
 | Problem | Fix |
 |---|---|
-| "No VLM yet" | connect the `vlm` input and run the workflow once, or type the description |
+| "The panel has no VLM" | connect the `vlm` input (to a CLIPLoader with Qwen3-VL), or type the description |
 | "Select the person first" | the shot has no points or mask text: use **🎯 Points…** |
 | "SAM 3 found nothing" | click again on the person (on the torso), or try another frame with the slider |
 | Only the face or the hair is described | the click was on the head: click the body |

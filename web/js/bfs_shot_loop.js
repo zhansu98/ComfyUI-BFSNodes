@@ -36,6 +36,46 @@ const store = {   // per-browser UI conveniences (never the plan itself)
   get: (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } },
 };
+// the loader wired to this planner's vlm input, as ComfyUI would run it ({class_type, inputs, slot}), so the server can
+// load the VLM for the panel's buttons before the workflow has run once; null when nothing (active) is connected.
+// Read from this node's own link, not by serializing the whole graph (other widgets' hooks would run on every click);
+// only a virtual hop (Reroute, Set/Get) needs the serialized graph, and only for a planner in the root graph, where
+// its id is unambiguous. Errors are thrown so the button shows them instead of using a VLM loaded earlier.
+async function vlmSourceOf(node) {
+  const slot = (node.inputs || []).findIndex(x => x.name === "vlm");
+  const linkId = slot >= 0 ? node.inputs[slot].link : null;
+  if (linkId == null) return null;
+  const graph = node.graph;
+  const linkOf = id => graph?.getLink?.(id) ?? (graph?.links instanceof Map ? graph.links.get(id) : graph?.links?.[id]);
+  const link = linkOf(linkId);
+  const origin = link ? graph.getNodeById(link.origin_id) : null;
+  if (origin && !origin.isVirtualNode) {
+    if (origin.mode === 2 || origin.mode === 4) return null;   // muted / bypassed loader: not run, like a queue
+    const inputs = {};
+    const widgets = origin.widgets || [];
+    for (let i = 0; i < widgets.length; i++) {   // what a queue sends: the widget's serializeValue when it has one
+      const w = widgets[i];
+      if (!w.name || w.options?.serialize === false) continue;
+      const v = w.serializeValue ? await w.serializeValue(origin, i) : w.value;
+      inputs[w.name] = Array.isArray(v) ? { __value__: v } : v;
+    }
+    for (const inp of origin.inputs || []) {   // a linked input: the server refuses to load it alone
+      const l = inp.link != null ? linkOf(inp.link) : null;
+      if (l) inputs[inp.widget?.name ?? inp.name] = [String(l.origin_id), l.origin_slot];
+    }
+    return { class_type: origin.comfyClass ?? origin.type, inputs, slot: link.origin_slot };
+  }
+  const root = app.rootGraph ?? app.graph;
+  if (graph && root && graph !== root)
+    throw new Error("The VLM loader of a Shot Planner inside a subgraph must be wired straight to its vlm input for the panel to load it. Run the workflow once instead.");
+  const { output } = await app.graphToPrompt();
+  const me = output?.[String(node.id)];
+  if (me?.class_type !== "BFSShotPlanner") return null;
+  const via = me.inputs?.vlm;
+  if (!Array.isArray(via)) return null;
+  const src = output[String(via[0])];
+  return src ? { class_type: src.class_type, inputs: src.inputs, slot: via[1] } : null;
+}
 const DEFAULT_W = 1180, MIN_W = 1040, MIN_H = 1000;   // node size: wide enough for the four-column settings
 const TABS = [["video", "🎞 Video"], ["shots", "🎬 Shots"], ["people", "👥 People / Filters / Masks"], ["prompts", "📝 Prompts & refs"], ["run", "▶ Run"]];
 
@@ -344,11 +384,13 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     const s = segs.value[i]; if (!s) return;
     busy.value = "Selecting the person (SAM 3) and describing them (VLM)…"; busySince.value = Date.now(); error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/target", { method: "POST", body: JSON.stringify({ plan: { ...plan }, index: i }) });
+      const r = await api.fetchApi("/bfs/shotloop/target", { method: "POST", body: JSON.stringify({ plan: { ...plan }, index: i, vlm_source: await io.vlmSource?.() }) });
       const j = await r.json(); if (j.error) throw new Error(j.error);
       targetCrop.value = { ...targetCrop.value, [segKey(s)]: j.crop };
       if (j.desc) setMeta(i, "target", j.desc);
-      else error.value = "The SAM 3 target cutout was created (shown below), but no VLM is loaded to describe it. Connect Qwen3-VL to the Shot Planner's vlm input and queue the workflow once; then click Describe target again. You can also type the target description yourself.";
+      else if (j.vlm_error) error.value = `${j.vlm_error} (The SAM 3 cutout is shown below; you can type the target description yourself.)`;
+      else if (!j.no_vlm) error.value = "The SAM 3 target cutout was created (shown below), but the VLM returned no description. Click Describe target again, try another describe preset or the 8B model, or type the target description yourself.";
+      else error.value = "The SAM 3 target cutout was created (shown below), but no VLM is connected to describe it. Connect Qwen3-VL to the Shot Planner's vlm input; then click Describe target again. You can also type the target description yourself.";
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
   }
@@ -493,7 +535,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   async function analyseVLM() {
     busy.value = "Asking the VLM about every shot…"; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/vlm", { method: "POST", body: JSON.stringify({ plan: { ...plan } }) });
+      const r = await api.fetchApi("/bfs/shotloop/vlm", { method: "POST", body: JSON.stringify({ plan: { ...plan }, vlm_source: await io.vlmSource?.() }) });
       const j = await r.json(); if (j.error) throw new Error(j.error);
       mergeSug(j.segs);
     } catch (e) { error.value = String(e.message || e); }
@@ -513,7 +555,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     busy.value = "Describing the pictures with the VLM…"; error.value = "";
     try {
       const r = await api.fetchApi("/bfs/shotloop/describe", { method: "POST",
-        body: JSON.stringify({ plan: { ...plan }, pictures: names }) });
+        body: JSON.stringify({ plan: { ...plan }, pictures: names, vlm_source: await io.vlmSource?.() }) });
       const j = await r.json(); if (j.error) throw new Error(j.error);
       plan.picture_details = { ...plan.picture_details, ...j.pictures }; save();
     } catch (e) { error.value = String(e.message || e); }
@@ -539,7 +581,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   async function writePrompts(indices = segs.value.map((_, i) => i)) {
     busy.value = `Writing ${indices.length} prompt(s) with the VLM…`; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/autoprompt", { method: "POST", body: JSON.stringify({ plan: { ...plan }, indices }) });
+      const r = await api.fetchApi("/bfs/shotloop/autoprompt", { method: "POST", body: JSON.stringify({ plan: { ...plan }, indices, vlm_source: await io.vlmSource?.() }) });
       const j = await r.json(); if (j.error) throw new Error(j.error);
       plan.auto_prompts = { ...plan.auto_prompts, ...j.prompts }; save();
     } catch (e) { error.value = String(e.message || e); }
@@ -1033,6 +1075,7 @@ app.registerExtension({
         getPlan: () => planWidget?.value ?? "{}",
         setPlan: v => { if (planWidget) planWidget.value = v; node.graph?.setDirtyCanvas(true); },
         expose: o => Object.assign(handle, o),
+        vlmSource: () => vlmSourceOf(node),
       }),
     }).mount(host);
     if (planWidget) {

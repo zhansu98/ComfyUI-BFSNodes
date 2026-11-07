@@ -1923,3 +1923,222 @@ class PromptReferenceContractTest(unittest.TestCase):
                     ["fox wearing blue pants", "city street"], "Use Picture 2 for the setting", {},
                     style="captions", source_facts="A dancer is moving in a street.")
         self.assertEqual(generator.call_count, 2)
+
+
+class PanelVlmTest(unittest.TestCase):
+    """The panel's VLM buttons load the VLM themselves from the loader wired to the planner's vlm input (sent by the
+    browser), so prompts can be written before the workflow has run once; the VLM a run handed the planner wins."""
+
+    class _Loader:
+        calls = []
+        RETURN_TYPES = ("CLIP",)
+        FUNCTION = "load_clip"
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {"clip_name": (["qwen3vl_8b.safetensors", "qwen3vl_4b.safetensors"],),
+                                 "type": (["stable_diffusion", "qwen_image"],)},
+                    "optional": {"device": (["default", "cpu"], {"advanced": True})}}
+
+        def load_clip(self, clip_name, type="stable_diffusion", device="default"):
+            PanelVlmTest._Loader.calls.append((clip_name, type, device))
+            return (f"clip:{clip_name}",)
+
+    class _Image:
+        RETURN_TYPES = ("IMAGE",)
+        FUNCTION = "load"
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {}}
+
+    @staticmethod
+    def _src(name="qwen3vl_8b.safetensors", ct="CLIPLoader", **extra):
+        return {"class_type": ct, "inputs": {"clip_name": name, "type": "qwen_image", "device": "default", **extra},
+                "slot": 0}
+
+    def setUp(self):
+        self._Loader.calls = []
+        nodes = types.ModuleType("nodes")
+        nodes.NODE_CLASS_MAPPINGS = {"CLIPLoader": self._Loader, "LoadImage": self._Image}
+        self._nodes = patch.dict(sys.modules, {"nodes": nodes})
+        self._nodes.start()
+        self._vlm = patch.dict(SL._VLM, clear=True)
+        self._vlm.start()
+
+    def tearDown(self):
+        self._vlm.stop()
+        self._nodes.stop()
+
+    def test_no_vlm_and_no_loader_asks_to_connect_it(self):
+        with self.assertRaisesRegex(ValueError, "planner's vlm input"):
+            SL.panel_vlm(None)
+        self.assertIsNone(SL.panel_vlm(None, required=False))
+        self.assertEqual(self._Loader.calls, [])
+
+    def test_loads_from_the_wired_loader_before_any_run_and_keeps_it(self):
+        self.assertEqual(SL.panel_vlm(self._src()), "clip:qwen3vl_8b.safetensors")
+        self.assertEqual(SL.panel_vlm(self._src()), "clip:qwen3vl_8b.safetensors")
+        self.assertEqual(self._Loader.calls, [("qwen3vl_8b.safetensors", "qwen_image", "default")])
+
+    def test_a_changed_loader_loads_again(self):
+        SL.panel_vlm(self._src())
+        self.assertEqual(SL.panel_vlm(self._src("qwen3vl_4b.safetensors")), "clip:qwen3vl_4b.safetensors")
+        self.assertEqual(len(self._Loader.calls), 2)
+
+    def test_the_vlm_a_run_handed_the_planner_wins(self):
+        SL._VLM.update(clip="clip:from-run", source=None)
+        self.assertEqual(SL.panel_vlm(self._src("qwen3vl_4b.safetensors")), "clip:from-run")
+        self.assertEqual(SL.panel_vlm(None), "clip:from-run")
+        self.assertEqual(self._Loader.calls, [])
+
+    def test_a_value_the_server_does_not_offer_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "not an option"):
+            SL.panel_vlm(self._src("../../secret.safetensors"))
+        self.assertEqual(self._Loader.calls, [])
+        self.assertNotIn("clip", SL._VLM)
+
+    def test_loaders_it_cannot_run_alone_say_to_run_once(self):
+        cases = [self._src(ct="Missing"), self._src(ct="LoadImage"),
+                 self._src(clip_name=["12", 0])]
+        for source, why in zip(cases, ("not an installed node", "cannot load", "connected to other nodes")):
+            with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
+                SL.panel_vlm(source)
+        self.assertEqual(self._Loader.calls, [])
+
+    def test_unknown_inputs_are_not_passed_to_the_loader(self):
+        self.assertEqual(SL.panel_vlm(self._src(extra_widget="x")), "clip:qwen3vl_8b.safetensors")
+        self.assertEqual(len(self._Loader.calls), 1)
+
+    def test_a_loader_that_fails_its_checks_keeps_the_loaded_vlm(self):
+        SL.panel_vlm(self._src())
+        with self.assertRaisesRegex(ValueError, "not an option"):
+            SL.panel_vlm(self._src("missing.safetensors"))
+        self.assertEqual(SL._VLM["clip"], "clip:qwen3vl_8b.safetensors")
+        self.assertEqual(SL.panel_vlm(self._src()), "clip:qwen3vl_8b.safetensors")
+        self.assertEqual(len(self._Loader.calls), 1)
+
+    def test_v3_combo_options_are_checked_and_other_slots_and_dict_results_work(self):
+        class Checkpoint:
+            RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+            FUNCTION = "load"
+
+            @classmethod
+            def INPUT_TYPES(cls):
+                return {"required": {"ckpt_name": ("COMBO", {"options": ["a.safetensors"]})}}
+
+            def load(self, ckpt_name):
+                return {"result": ("model", f"clip:{ckpt_name}", "vae")}
+        sys.modules["nodes"].NODE_CLASS_MAPPINGS["Checkpoint"] = Checkpoint
+        src = {"class_type": "Checkpoint", "inputs": {"ckpt_name": "b.safetensors"}, "slot": 1}
+        with self.assertRaisesRegex(ValueError, "not an option"):
+            SL.panel_vlm(src)
+        src["inputs"]["ckpt_name"] = "a.safetensors"
+        self.assertEqual(SL.panel_vlm(src), "clip:a.safetensors")
+
+    def test_an_async_loader_says_to_run_once(self):
+        class Async(self._Loader):
+            async def load_clip(self, clip_name, type="stable_diffusion", device="default"):
+                return ("never",)
+        sys.modules["nodes"].NODE_CLASS_MAPPINGS["CLIPLoader"] = Async
+        with self.assertRaisesRegex(ValueError, "async"):
+            SL.panel_vlm(self._src())
+        self.assertNotIn("clip", SL._VLM)
+
+    def test_a_run_that_hands_over_its_vlm_during_a_panel_load_wins(self):
+        def load_clip(this, clip_name, type="stable_diffusion", device="default"):
+            SL.publish_run_vlm("clip:from-run")   # the planner runs while the panel is loading
+            return (f"clip:{clip_name}",)
+        with patch.object(self._Loader, "load_clip", load_clip):
+            self.assertEqual(SL.panel_vlm(self._src()), "clip:from-run")
+        self.assertEqual((SL._VLM["clip"], SL._VLM["source"]), ("clip:from-run", None))
+        self.assertEqual(SL.panel_vlm(self._src("qwen3vl_4b.safetensors")), "clip:from-run")
+
+    def test_the_old_vlm_is_released_before_the_new_one_loads(self):
+        import gc
+        import weakref
+
+        class Clip:
+            pass
+        seen = {}
+
+        def load_clip(this, clip_name, type="stable_diffusion", device="default"):
+            if "old" in seen:
+                gc.collect()
+                seen["alive_during_load"] = seen["old"]() is not None
+            return (Clip(),)
+        with patch.object(self._Loader, "load_clip", load_clip):
+            seen["old"] = weakref.ref(SL.panel_vlm(self._src()))
+            SL.panel_vlm(self._src("qwen3vl_4b.safetensors"))
+        self.assertIs(seen["alive_during_load"], False)
+
+    def test_a_load_that_fails_after_its_checks_is_retried(self):
+        SL.panel_vlm(self._src())
+        boom = {"n": 0}
+
+        def load_clip(this, clip_name, type="stable_diffusion", device="default"):
+            boom["n"] += 1
+            if boom["n"] == 1:
+                raise RuntimeError("out of memory")
+            return (f"clip:{clip_name}",)
+        with patch.object(self._Loader, "load_clip", load_clip):
+            with self.assertRaisesRegex(RuntimeError, "out of memory"):
+                SL.panel_vlm(self._src("qwen3vl_4b.safetensors"))
+            self.assertIsNone(SL.panel_vlm(None, required=False))
+            self.assertEqual(SL.panel_vlm(self._src("qwen3vl_4b.safetensors")), "clip:qwen3vl_4b.safetensors")
+
+    def test_a_panel_load_that_fails_while_a_run_hands_over_its_vlm_uses_the_run_vlm(self):
+        def load_clip(this, clip_name, type="stable_diffusion", device="default"):
+            SL.publish_run_vlm("clip:from-run")
+            raise RuntimeError("out of memory")
+        with patch.object(self._Loader, "load_clip", load_clip):
+            self.assertEqual(SL.panel_vlm(self._src()), "clip:from-run")
+
+    def test_concurrent_clicks_load_once(self):
+        import threading
+        import time
+
+        def load_clip(this, clip_name, type="stable_diffusion", device="default"):
+            PanelVlmTest._Loader.calls.append(clip_name)
+            time.sleep(0.05)
+            return (f"clip:{clip_name}",)
+        got = []
+        with patch.object(self._Loader, "load_clip", load_clip):
+            threads = [threading.Thread(target=lambda: got.append(SL.panel_vlm(self._src()))) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(got, ["clip:qwen3vl_8b.safetensors"] * 3)
+        self.assertEqual(len(self._Loader.calls), 1)
+
+    def test_wrapped_values_and_result_objects(self):
+        class Out:   # a V3 NodeOutput keeps its outputs in .args
+            def __init__(self, *args):
+                self.args = args
+
+        def load_clip(this, clip_name, type="stable_diffusion", device="default"):
+            return Out(f"clip:{clip_name}")
+        with patch.object(self._Loader, "load_clip", load_clip):
+            self.assertEqual(SL.panel_vlm(self._src({"__value__": "qwen3vl_4b.safetensors"})),
+                             "clip:qwen3vl_4b.safetensors")
+
+    def test_the_answer_caches_never_reuse_a_dropped_models_key(self):
+        class Clip:
+            pass
+        a = Clip()
+        key_a = SL._vlm_identity(a)
+        self.assertEqual(SL._vlm_identity(a), key_a)
+        seen = {key_a}
+        del a
+        for _ in range(50):   # id() values get recycled; these keys must not
+            c = Clip()
+            k = SL._vlm_identity(c)
+            self.assertNotIn(k, seen)
+            seen.add(k)
+            del c
+
+    def test_no_answer_cache_keys_on_id_of_the_model(self):
+        src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count("id(clip)"), 1, "only _vlm_identity's fallback may use id(clip)")
+        self.assertEqual(src.count("_vlm_identity(clip)"), 5)   # the definition + the four answer caches

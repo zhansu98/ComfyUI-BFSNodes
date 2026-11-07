@@ -23,6 +23,7 @@ import re
 import math
 import os
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -1671,6 +1672,130 @@ DEFAULT_VLM = {"enabled": False, "frames": 3, "max_tokens": 1024, "auto_segment"
                "temperature": 0.0, "seed": 0, "image_max_side": 1024}
 _VLM: dict[str, Any] = {}            # the VLM connected to a planner (kept for the panel's Analyse button)
 _VLM_CACHE: dict[tuple, dict] = {}
+_VLM_IDS = iter(range(1, 1 << 62))
+
+
+def _vlm_identity(clip):
+    """A key for the VLM answer caches that is never reused: id() is, once the panel drops a model and loads another,
+    so a new model could get the old one's cached answers."""
+    tok = getattr(clip, "_bfs_vlm_id", None)
+    if tok is None:
+        tok = next(_VLM_IDS)
+        try:
+            setattr(clip, "_bfs_vlm_id", tok)
+        except (AttributeError, TypeError):
+            return ("id", id(clip))
+    return tok
+NO_VLM = ("The panel has no VLM. Connect the VLM (a CLIPLoader with a Qwen3-VL text encoder, the same one Generate "
+          "Text uses) to the planner's vlm input.")
+
+
+def _vlm_source_key(source: dict) -> str:
+    return json.dumps([source.get("class_type"), source.get("inputs") or {}, int(source.get("slot") or 0)],
+                      sort_keys=True, default=str)
+
+
+def _vlm_loader(source: dict):
+    """Check the loader node wired to the planner's vlm input before anything is loaded: `source` is
+    {"class_type", "inputs", "slot"} from the browser's graph. Only a loader whose inputs are all set on the node
+    (no links) and whose output is a CLIP can be loaded here; anything else needs one run. -> (cls, fn, slot, kwargs)"""
+    import nodes
+    ct = str(source.get("class_type") or "")
+    cls = nodes.NODE_CLASS_MAPPINGS.get(ct)
+    if cls is None:
+        raise ValueError(f"The planner's vlm input comes from '{ct or '?'}', which is not an installed node.")
+    once = " Run the workflow once instead: the panel then uses the VLM the planner received."
+    fn = getattr(cls, "FUNCTION", None)
+    slot = int(source.get("slot") or 0)
+    rt = tuple(getattr(cls, "RETURN_TYPES", ()) or ())
+    if not isinstance(fn, str) or slot >= len(rt) or rt[slot] != "CLIP":
+        raise ValueError(f"The panel cannot load the VLM from a '{ct}' node." + once)
+    given = source.get("inputs") or {}
+    if any(isinstance(v, list) for v in given.values()):
+        raise ValueError(f"The '{ct}' node wired to the planner's vlm input has inputs connected to other nodes, "
+                         "so the panel cannot load it by itself." + once)
+    spec = cls.INPUT_TYPES()
+    declared = {**(spec.get("optional") or {}), **(spec.get("required") or {})}
+    kwargs = {}
+    for name, value in given.items():
+        if name not in declared:
+            continue
+        if isinstance(value, dict) and set(value) == {"__value__"}:   # the frontend's wrap of a list value
+            value = value["__value__"]
+        options = declared[name][0] if declared[name] else None
+        if options == "COMBO":   # the V3 form: ("COMBO", {"options": [...]})
+            extra = declared[name][1] if len(declared[name]) > 1 and isinstance(declared[name][1], dict) else {}
+            options = extra.get("options")
+        if isinstance(options, (list, tuple)) and value not in options:
+            raise ValueError(f"'{value}' is not an option of {ct}.{name} on this server.")
+        kwargs[name] = value
+    return cls, fn, slot, kwargs
+
+
+def load_vlm_source(source: dict, checked=None):
+    """Load the VLM from the loader node wired to the planner's vlm input, as ComfyUI would run it."""
+    import inspect
+    cls, fn, slot, kwargs = checked or _vlm_loader(source)
+    out = getattr(cls(), fn)(**kwargs)
+    if inspect.iscoroutine(out):
+        out.close()
+        raise ValueError(f"The panel cannot run the '{source.get('class_type')}' loader by itself (it is async). "
+                         "Run the workflow once instead: the panel then uses the VLM the planner received.")
+    if isinstance(out, dict):
+        out = out.get("result")
+    elif not isinstance(out, (tuple, list)) and hasattr(out, "args"):   # a V3 NodeOutput
+        out = out.args
+    return out[slot]
+
+
+_VLM_LOCK = threading.Lock()    # held while the panel loads a VLM: two buttons at once load it once
+_VLM_STATE = threading.Lock()   # held briefly to read / publish / drop _VLM (a run publishes without waiting on a load)
+
+
+def publish_run_vlm(vlm) -> None:
+    """The planner received `vlm` from a run: the panel's buttons use it until the next run, and a panel load still
+    in progress is discarded instead of replacing it."""
+    with _VLM_STATE:
+        _VLM.update(clip=vlm, source=None, gen=_VLM.get("gen", 0) + 1)
+
+
+def panel_vlm(source: dict | None = None, required: bool = True):
+    """The VLM the panel's buttons use: the one the planner received in the last run, else the one loaded here from
+    `source` (the loader wired to the planner's vlm input), so the buttons work before any run. A VLM the panel
+    loaded is loaded again when the loader's settings change."""
+    key = _vlm_source_key(source) if source else None
+    with _VLM_STATE:
+        clip, have = _VLM.get("clip"), _VLM.get("source")
+    if clip is not None and (key is None or have in (None, key)):
+        return clip
+    clip = None   # do not keep the old VLM alive while the new one loads (two 8B copies)
+    if key is None:
+        if required:
+            raise ValueError(NO_VLM)
+        return None
+    with _VLM_LOCK:
+        with _VLM_STATE:
+            if _VLM.get("clip") is not None and _VLM.get("source") in (None, key):
+                return _VLM["clip"]   # loaded (or handed over by a run) while this call waited
+            gen = _VLM.get("gen", 0)
+        checked = _vlm_loader(source)   # a loader that cannot be loaded keeps the VLM already loaded
+        with _VLM_STATE:
+            if _VLM.get("gen", 0) != gen:
+                return _VLM["clip"]
+            _VLM.pop("clip", None)   # drop the old one before loading the new one
+        print(f"[BFS Shot Planner] loading the VLM for the panel ({source.get('class_type')})", flush=True)
+        try:
+            loaded = load_vlm_source(source, checked)
+        except Exception:
+            with _VLM_STATE:
+                if _VLM.get("gen", 0) != gen and _VLM.get("clip") is not None:
+                    return _VLM["clip"]   # a run handed the planner its VLM meanwhile: use it
+            raise
+        with _VLM_STATE:
+            if _VLM.get("gen", 0) != gen:   # a run handed the planner its VLM meanwhile: that one wins
+                return _VLM["clip"]
+            _VLM.update(clip=loaded, source=key)
+            return loaded
 
 VLM_QUESTION = """You see {n} frames (in time order) of ONE camera shot from a video that will be edited with an AI video model.
 Answer with one JSON object only, no code fence:
@@ -1784,7 +1909,7 @@ def _parse_json(text: str) -> dict:
 
 def vlm_shot(clip, path: str, analysis: dict, start: int, end: int, cfg: dict) -> dict:
     """Ask the VLM about one shot (a few frames); cached per shot and settings."""
-    key = (path, os.path.getmtime(path), int(start), int(end), id(clip),
+    key = (path, os.path.getmtime(path), int(start), int(end), _vlm_identity(clip),
            json.dumps({k: cfg[k] for k in ("frames", "max_tokens", "instruction", "image_max_side")}, sort_keys=True))
     if key in _VLM_CACHE:
         return _VLM_CACHE[key]
@@ -1936,7 +2061,7 @@ def vlm_describe(clip, images: list, instruction: str, max_tokens: int = 320, te
     if not images:
         return ""
     side = max(224, min(4096, int(image_max_side or 1024)))
-    key = (tuple(_image_key(im) for im in images), instruction, id(clip), int(max_tokens), float(temperature), int(seed), side)
+    key = (tuple(_image_key(im) for im in images), instruction, _vlm_identity(clip), int(max_tokens), float(temperature), int(seed), side)
     if key in _DESCRIBE_CACHE:
         return _DESCRIBE_CACHE[key]
     from comfy_extras.nodes_textgen import TextGenerate
@@ -2611,7 +2736,7 @@ def write_duet_prompt(clip, frames: list, refs: list, task: str, change: str, ma
     sections are assembled here, so a small model cannot break the format."""
     refs = [r for r in refs if r is not None]
     fr = [f for f in frames if f is not None]
-    key = ("write3", tuple(_image_key(f) for f in fr), tuple(_image_key(r) for r in refs), task, change, id(clip),
+    key = ("write3", tuple(_image_key(f) for f in fr), tuple(_image_key(r) for r in refs), task, change, _vlm_identity(clip),
            int(max_tokens), mode, _image_key(setting), tuple(times or ()))
     if key in _DESCRIBE_CACHE:
         return _DESCRIBE_CACHE[key]
@@ -2714,7 +2839,7 @@ def fill_duet_template(clip, template: str, frames: list, refs: list, task: str,
     refs = [r for r in refs if r is not None]
     fr = [f for f in frames if f is not None]
     key = ("fill2", tuple(times or ()), template, tuple(_image_key(f) for f in fr), tuple(_image_key(r) for r in refs), task, change,
-           id(clip), int(max_tokens), _image_key(setting))
+           _vlm_identity(clip), int(max_tokens), _image_key(setting))
     if key in _DESCRIBE_CACHE:
         return _DESCRIBE_CACHE[key]
     slots = template_slots(template)
@@ -3448,7 +3573,7 @@ class BFSShotPlanner:
             print("[BFS Shot Planner] ref_image / ref_image_2 are no longer planner inputs: the connected images "
                   "are ignored. Set the references in the panel (Prompts & refs tab, up to 100).", flush=True)
         if vlm is not None:
-            _VLM["clip"] = vlm       # the panel's Analyse button uses it too
+            publish_run_vlm(vlm)     # the panel's VLM buttons use it too, until the next run
         vcfg = vlm_cfg(p.get("vlm_cfg"))
         use_vlm = vlm is not None and vcfg["enabled"]
         suggestions = []
@@ -5938,16 +6063,11 @@ try:
     async def _bfs_shot_vlm(request):
         body = await request.json()
         try:
-            clip = _VLM.get("clip")
-            if clip is None:
-                raise ValueError("The panel has no VLM yet. Connect the VLM (a CLIPLoader with a Qwen3-VL text encoder, "
-                                 "the same one Generate Text uses) to the planner's vlm input and run the workflow once "
-                                 "(Queue): ComfyUI only hands models to nodes when they run. After that the panel's "
-                                 "VLM buttons use it.")
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
             a = analyze(path, float(p["fps"]))
             segs = resolve_plan(p, a, path)
+            clip = await _off_loop(lambda: panel_vlm(body.get("vlm_source")))
             want = body.get("indices")
             pick = [segs[i] for i in want] if want else segs
             cfg = vlm_cfg(p.get("vlm_cfg"))
@@ -5974,13 +6094,16 @@ try:
             if not spec_has_mask(spec):
                 raise ValueError("Select the person first: 🎯 Points… (click on them), type what to segment, or give the "
                                  "shot a mask video.")
-            clip = _VLM.get("clip")
 
             def work():
                 import cv2
                 crop = target_crop(path, a, seg["start"], seg["end"] - seg["start"], spec)
                 if crop is None:
                     raise ValueError("SAM 3 found nothing at that selection.")
+                try:
+                    clip, why = panel_vlm(body.get("vlm_source"), required=False), ""
+                except Exception as exc:  # noqa: BLE001 - the cut-out still comes back; the user types the text
+                    clip, why = None, f"{type(exc).__name__}: {exc}"
                 tcfg = vlm_cfg(p.get("vlm_cfg"))
                 tslot = prompt_slot(seg.get("prompt") or p.get("global_prompt", ""), "{target}") if tcfg.get("fit_prompt", True) else ""
                 desc = describe_target(clip, crop, slot=tslot, temperature=float(tcfg.get("temperature") or 0),
@@ -5988,7 +6111,7 @@ try:
                                        image_max_side=int(tcfg.get("image_max_side") or 1024)) if clip is not None else ""
                 ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
                 return {"desc": desc, "crop": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode(),
-                        "no_vlm": clip is None}
+                        "no_vlm": clip is None, "vlm_error": why}
             out = await _off_loop(work)
         except Exception as exc:  # noqa: BLE001
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
@@ -6000,16 +6123,11 @@ try:
         the description is written for the global prompt's sentence about that picture ({details} = picture 1)."""
         body = await request.json()
         try:
-            clip = _VLM.get("clip")
-            if clip is None:
-                raise ValueError("The panel has no VLM yet. Connect the VLM (a CLIPLoader with a Qwen3-VL text encoder, "
-                                 "the same one Generate Text uses) to the planner's vlm input and run the workflow once "
-                                 "(Queue): ComfyUI only hands models to nodes when they run. After that the panel's "
-                                 "VLM buttons use it.")
             p = _load_plan(json.dumps(body.get("plan", {})))
             cfg = vlm_cfg(p.get("vlm_cfg"))
             prompt = picture_markers(body.get("prompt") or p.get("global_prompt", ""))
             pictures = [str(x) for x in body.get("pictures") or [] if x]
+            clip = await _off_loop(lambda: panel_vlm(body.get("vlm_source")))
 
             def work():
                 out = {}
@@ -6029,14 +6147,11 @@ try:
         {text, for}}}."""
         body = await request.json()
         try:
-            clip = _VLM.get("clip")
-            if clip is None:
-                raise ValueError("The panel has no VLM yet. Connect the VLM to the planner's vlm input and run the "
-                                 "workflow once (Queue): ComfyUI only hands models to nodes when they run.")
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
             cfg = vlm_cfg(p.get("vlm_cfg"))
             details = saved_picture_details(p)
+            clip = await _off_loop(lambda: panel_vlm(body.get("vlm_source")))
 
             def work():
                 a = analyze(path, float(p["fps"]))

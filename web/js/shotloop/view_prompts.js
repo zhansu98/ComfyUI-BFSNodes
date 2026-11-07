@@ -55,7 +55,7 @@ function vlmSection(c) {
         h("button", { class: "pri", disabled: !!busy.value, onClick: c.analyseVLM }, "🤖 Analyse shots"),
         h("button", { disabled: !sugN, onClick: c.applyAllSug, title: "Mask text for shots without one, skip where the VLM says skip" }, "Apply suggestions → all"),
       ]),
-      hint("Connect a Qwen3-VL (CLIPLoader) to the planner's vlm input. The VLM buttons work after the workflow has run once with it connected (ComfyUI only hands models to nodes when they run). Each shot's suggestion shows in its editor.", "display:block;margin-top:4px"),
+      hint("Connect a Qwen3-VL (CLIPLoader) to the planner's vlm input. No run needed: the first VLM button you click loads it (this takes a moment). Each shot's suggestion shows in its editor.", "display:block;margin-top:4px"),
     ], { sub: "looks at every shot and suggests the mask, a description and whether to run it",
          right: h("span", { class: "row" }, [VC.enabled ? pill("on", "ok") : pill("off"), sugN ? pill(`${sugN} suggestions`) : null]) }),
     section("Describe references ({details})", [
