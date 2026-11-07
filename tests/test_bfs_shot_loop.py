@@ -1735,6 +1735,102 @@ class IsolatedReferenceBindingTests(unittest.TestCase):
         self.assertNotEqual(SL.auto_prompt_for("edit", [], {}, prompt_trigger=""), SL.auto_prompt_for("edit", [], {}, prompt_trigger="motion_transfer"))
 
 
+class AutoPromptDetailsTest(unittest.TestCase):
+    """🤖 Auto prompt: the template's {details} is the picture described alone for its sentence with the describe
+    settings (preset / custom instruction, fit the prompt), while the writer still gets the isolated evidence."""
+
+    TEMPLATE = ("body_swap: subject_definitions: <Subject 1> is the {details} shown in <Picture 1>, whose identity, "
+                "face, head, hair or fur, skin, body shape, proportions and clothing define the character.\n"
+                "summary: Replace the guide subject with <Subject 1>.\ndetailed_description: [Shot 1] <Subject 1> moves.")
+    EVIDENCE = ("The image shows a man with dark, curly hair and a prominent mustache smiles, giving two thumbs up. He "
+                "wears a white shirt with red cuffs. Behind him, rustic wooden tools hang on a white wall beside a "
+                "green-framed window.")
+    LIST = "Male, dark curly hair, prominent mustache, white shirt with red cuffs"
+    CUSTOM = ("Describe the main character in this reference picture as one comma-separated English attribute list. "
+              "Never the background, camera, lighting or pose. Only the list.")
+
+    def setUp(self):
+        self.names, self.pictures = ["a.png"], [torch.zeros(1, 4, 4, 3)]
+        self.instructions = []
+
+    def _describe(self, phrase):
+        def describe(clip, batch, instruction, tokens, *args, **kwargs):
+            self.assertEqual(len(batch), 1)   # every picture is described alone
+            self.instructions.append(instruction)
+            return self.EVIDENCE if "ONLY <Picture 1>" in instruction else phrase
+        return describe
+
+    def test_template_details_use_the_describe_settings_not_the_raw_evidence(self):
+        import numpy as np
+        analysis = {"fps": 24.0, "fps_src": 24.0, "n_src": 48, "n": 48, "width": 8, "height": 8}
+        seg = {"start": 0, "end": 24, "prompt": ""}
+        # a saved description is never read in Auto prompt (it can be stale or from a grouped batch, see deb243c)
+        plan = {"auto_prompt": {"enabled": True}, "picture_details": {"a.png": "STALE saved text"},
+                "ref_details": {"a.png": "STALE ref text"}}
+        vcfg = SL.vlm_cfg({"describe_preset": "custom", "describe_custom": self.CUSTOM, "fit_prompt": True})
+        captured = []
+        with patch.object(SL, "find_cuts", return_value=([], "none")), \
+                patch.object(SL, "_read_frames", side_effect=lambda path, idx, size, stage=None:
+                             [np.zeros((8, 8, 3), np.uint8) for _ in idx]), \
+                patch.object(SL, "_status"), \
+                patch.object(SL, "vlm_generate", return_value="A man gives two thumbs up."), \
+                patch.object(SL, "vlm_describe", side_effect=self._describe(self.LIST)), \
+                patch.object(SL, "write_h3_prompt", side_effect=lambda *a, **k: captured.append((a, k)) or "body_swap: ok"):
+            out = SL.auto_prompt_shot(object(), plan, analysis, "x.mp4", seg, self.names, self.pictures, {},
+                                      "Replace the person in the video with the person in the reference <Picture 1>.",
+                                      vcfg, self.TEMPLATE)
+        self.assertEqual(out["text"], "body_swap: ok")
+        args = captured[0][0]
+        template, picture_texts = args[11], args[4]
+        self.assertIn(f"<Subject 1> is the {self.LIST} shown in <Picture 1>, whose identity", template)
+        self.assertNotIn("Behind him", template)
+        self.assertNotIn("STALE", template)
+        self.assertNotIn("{details", template)
+        self.assertEqual(picture_texts, [self.EVIDENCE])   # the writer still gets the isolated evidence
+        self.assertTrue(any(self.CUSTOM in i for i in self.instructions))   # the custom instruction is honoured
+
+    def test_default_short_preset_is_fitted_to_the_template_sentence(self):
+        cfg = SL.vlm_cfg({})
+        with patch.object(SL, "vlm_describe",
+                          side_effect=self._describe("the man with dark curly hair and a prominent mustache shown in <Picture 1>")):
+            out = SL.fresh_picture_details(object(), self.TEMPLATE, self.names, self.pictures, {}, cfg)
+        self.assertIn("<Subject 1> is the man with dark curly hair and a prominent mustache shown in <Picture 1>, whose", out)
+        self.assertNotIn("___", out)
+        self.assertIn("goes into the blank", self.instructions[0])
+        self.assertIn("<Subject 1> is the ___ shown in <Picture 1>", self.instructions[0])
+
+    def test_a_picture_keeps_its_own_preset_in_auto_prompt(self):
+        plan = {"picture_cfg": {"a.png": {"preset": "custom", "custom": "outfit only"}}}
+        with patch.object(SL, "vlm_describe", side_effect=self._describe("white shirt with red cuffs")):
+            SL.fresh_picture_details(object(), self.TEMPLATE, self.names, self.pictures, plan, SL.vlm_cfg({}))
+        self.assertIn("outfit only", self.instructions[0])
+
+    def test_request_details_are_filled_the_same_way(self):
+        with patch.object(SL, "vlm_describe", side_effect=self._describe("man with a mustache")):
+            out = SL.fresh_picture_details(object(), "Swap the person for the {details} from <Picture 1>.",
+                                           self.names, self.pictures, {}, SL.vlm_cfg({}))
+            missing = SL.fresh_picture_details(object(), "Add the {details2}.", ["a.png", "b.png"],
+                                               [self.pictures[0], None], {}, SL.vlm_cfg({}))
+        self.assertIn("man with a mustache", out)
+        self.assertNotIn("{details", out)
+        self.assertEqual(missing, "Add the character.")   # no picture 2: same fallback as fill_picture_details
+
+    def test_one_describe_call_per_picture_across_shots(self):
+        textgen = types.ModuleType("comfy_extras.nodes_textgen")
+        textgen.TextGenerate = type("TextGenerate", (), {})
+        comfy_extras = types.ModuleType("comfy_extras")
+        comfy_extras.__path__ = []
+        clip, calls = object(), []
+        SL._DESCRIBE_CACHE.clear()
+        with patch.dict(sys.modules, {"comfy_extras": comfy_extras, "comfy_extras.nodes_textgen": textgen}), \
+                patch.object(SL, "_status"), \
+                patch.object(SL, "vlm_generate", side_effect=lambda *a, **k: calls.append(a) or "man with a mustache"):
+            for _ in range(2):   # two shots of one run: same template, picture and settings
+                SL.fresh_picture_details(clip, self.TEMPLATE, self.names, self.pictures, {}, SL.vlm_cfg({}))
+        SL._DESCRIBE_CACHE.clear()
+        self.assertEqual(len(calls), 1)
+
+
 class PromptReferenceContractTest(unittest.TestCase):
     def test_short_caption_does_not_acquire_phantom_second_subject(self):
         text = "motion_transfer: Replace the dancer with the character from <Picture 1>. Use the requested setting."

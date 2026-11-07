@@ -436,7 +436,12 @@ writes each shot's MiniMax H3 prompt in the official full-reference format (Mini
 `body_swap: subject_definitions: ...`) is the **template** and the panel's text is the **request** applied to it
 ("Troque a mulher no vídeo pela mulher da <Picture 1>"). The template is kept as it is: same sentences, same order, its
 trigger word first; the writer applies the request, adds the pictures' visible features and, after `[Shot 1]`, this
-shot's camera, place, light and actions. The panel's 🤖 Write uses the template of the last run (shown in the card).
+shot's camera, place, light and actions. A `{details}` / `{details@Picture n}` in the template or the request is
+filled before the writer starts: that picture described by itself for that sentence, with the 📝 Describe settings
+(preset or custom instruction; *Fit the prompt* for the short and object presets), exactly as a run without Auto
+prompt does; the writer also gets its own description of every picture as evidence. Prompts written before 1.118.1
+are outdated: the next run writes them again with the planner's VLM (see below).
+The panel's 🤖 Write uses the template of the last run (shown in the card).
 A request that is itself a whole prompt (H3 sections) is used as the template the same way. **Style** picks how a prompt without template is written: *H3
 official* (the six sections) or *OpenJutsu captions*, the short style of the OpenJutsu training captions ("Replace the
 dog in the video with the gaunt goblin … from <Picture 1>. Replace the cat … from <Picture 2>. Keep the same background
@@ -450,9 +455,10 @@ Labels always keep their `< >`.
 **🤖 Write all prompts** (or *only the missing*) writes them now; each shot shows its written prompt in the Shots tab,
 editable, with **🤖 Write / Write again**. A shot without one is written when the workflow runs (with the VLM on the
 planner, before any SAM 3 work) and the panel keeps it, so the next run uses the same text. When the request,
-pictures, marks, selection or mode change after a prompt was written, the shot says it is *older*; it is still used
-until you write it again. A written prompt is part of the stored shot's signature, so editing it re-renders the shot.
-Without a VLM and without a written prompt, the request is used as the prompt.
+pictures, marks, selection or mode change after a prompt was written, the shot says it is *older*: the next run writes
+it again with the planner's VLM, and without one the run stops and asks you to 🤖 Write again (an outdated prompt is
+never sent to generation). A written prompt is part of the stored shot's signature, so editing it re-renders the shot.
+Without a VLM and without a written prompt, the template (else the request) is used as the prompt.
 
 ### One description per picture (1.113.0)
 

@@ -2116,7 +2116,7 @@ def _clean_written(text: str) -> str:
 
 # frames 0 = from the shot's length; style: "h3" (the official six sections) or "captions" (a short edit request)
 AUTO_PROMPT_DEFAULTS = {"enabled": False, "frames": 0, "source": "guide", "style": "h3", "trigger": "motion_transfer"}
-AUTO_PROMPT_REVISION = "motion-trigger-bindings-v7"
+AUTO_PROMPT_REVISION = "fitted-picture-details-v8"
 
 AUTO_REQUEST_RULES = """Motion-transfer contract and requested visual changes (apply in every output format):
 - The source performance is fixed: transfer the assigned performer's actions, body movement, gesture timing, head motion, gaze, visible mouth movement and expressions at the corresponding timestamps. Retarget that performance to the reference character's anatomy.
@@ -2478,6 +2478,26 @@ def isolated_picture_descriptions(clip, pictures: list, max_tokens: int = 320, i
     return descriptions
 
 
+def fresh_picture_details(clip, text: str, names: list, pictures: list, plan: dict, cfg: dict, tag: str = "") -> str:
+    """🤖 Auto prompt: every {details} / {details@Picture k} in `text` is that picture described alone now, for this
+    sentence and with the picture's describe settings (preset or custom instruction, fit the prompt), as a run
+    without Auto prompt does. Never a saved description: it can be stale or from a grouped reference batch."""
+    text = picture_markers(text)
+    fresh = {}
+    for m in PICTURE_DETAILS.finditer(text):
+        k = int(m.group(1)) - 1
+        if 0 <= k < len(names) and k < len(pictures) and pictures[k] is not None and names[k] not in fresh:
+            pcfg = picture_cfg(cfg, plan, names[k])
+            fresh[names[k]] = describe_picture(clip, pictures[k], text, m.group(0), pcfg)
+            if fresh[names[k]]:
+                print(f"{tag}: {m.group(0)} = {fresh[names[k]]!r} (described for the prompt)", flush=True)
+            else:   # the marker stays and the writer fills it from its own evidence: say so, it is not the preset
+                print(f"{tag}: {m.group(0)}: WARNING the VLM returned no description with the "
+                      f"'{pcfg.get('describe_preset') or 'short'}' describe settings; the prompt writer fills it "
+                      "from its own picture description instead", flush=True)
+    return fill_picture_details(text, names, pictures, fresh, keep_missing=True)
+
+
 def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, names: list, pictures: list,
                      pic_details: dict, instruction: str, vcfg: dict, template: str = "") -> dict:
     """Write one shot's prompt: {"text", "for"} (what it was made from, see auto_prompt_for)."""
@@ -2493,12 +2513,13 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
     sc = side / max(analysis["width"], analysis["height"])
     size = (max(32, int(analysis["width"] * sc) // 2 * 2), max(32, int(analysis["height"] * sc) // 2 * 2))
     frames = [torch.from_numpy(f.astype(np.float32) / 255.0)[None] for f in _read_frames(path, src[picks], size)]
-    # Saved details can be stale or have been produced from a grouped reference batch.
-    # Isolated image evidence stays local to this request; do not overwrite user fields.
+    # Saved details can be stale or have been produced from a grouped reference batch: neither is read here.
+    # The writer gets the isolated evidence of every picture; a {details} in the template or the request gets that
+    # picture described alone for its sentence with the user's describe settings (fresh_picture_details).
     picture_evidence = isolated_picture_descriptions(clip, pictures, 320, side)
-    fresh_details = dict(zip(names, picture_evidence))
-    request = fill_picture_details(picture_markers(instruction), names, pictures, fresh_details, keep_missing=True)
-    tmpl = fill_picture_details(picture_markers(template), names, pictures, fresh_details, keep_missing=True)
+    tag = f"[BFS Auto prompt] shot {seg['start']}-{seg['end']}"
+    request = fresh_picture_details(clip, instruction, names, pictures, plan, vcfg, tag)
+    tmpl = fresh_picture_details(clip, template, names, pictures, plan, vcfg, tag)
     source_question = ("These images are ONLY chronological frames of the SOURCE video, not replacement "
                        "references. Describe the visible actors separately, their apparent gender when clear, "
                        "distinctive source clothing, initial positions, actions and interactions through the frames. "
