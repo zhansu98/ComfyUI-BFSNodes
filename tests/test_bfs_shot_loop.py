@@ -1565,6 +1565,74 @@ class JoinRamGuardTest(unittest.TestCase):
         self.assertGreater(SL._join_bytes(10, 100, 200, True, 1024), SL._join_bytes(10, 100, 200, True, 50))
 
 
+class ShowVideoFileTest(unittest.TestCase):
+    """BFS Show Video File reports an MP4 already in the output folder (the join's video_path) to ComfyUI's outputs,
+    the same payload Save Video makes, without encoding it again; the join itself keeps returning plain outputs."""
+
+    @staticmethod
+    def _entry(name, sub):
+        return {"filename": name, "subfolder": sub, "type": "output"}
+
+    def test_reports_a_file_inside_the_output_folder(self):
+        d = tempfile.mkdtemp(dir=_TMP)
+        path = os.path.join(d, "x_00001.mp4")
+        for p in (path, os.path.join(d, "x_00001_comparison.mp4")):
+            Path(p).write_bytes(b"mp4")
+        sub = os.path.basename(d)
+        both = {"ui": {"images": [self._entry("x_00001.mp4", sub), self._entry("x_00001_comparison.mp4", sub)],
+                       "animated": (True,)}}
+        self.assertEqual(SL.BFSShowVideoFile().show(video_path=path), both)
+        self.assertEqual(SL.BFSShowVideoFile().show(video_path=os.path.join(sub, "x_00001.mp4")), both)  # relative
+        self.assertEqual(SL.BFSShowVideoFile().show(video_path=path, comparison=False),
+                         {"ui": {"images": [self._entry("x_00001.mp4", sub)], "animated": (True,)}})
+        top = os.path.join(_TMP, f"top_{id(self)}.mp4")   # no comparison file next to it: only the video
+        Path(top).write_bytes(b"mp4")
+        self.assertEqual(SL.BFSShowVideoFile().show(video_path=top, comparison=True)["ui"]["images"],
+                         [self._entry(os.path.basename(top), "")])
+        upper = os.path.join(d, "UP.MP4")
+        for p in (upper, os.path.join(d, "UP_comparison.mp4")):
+            Path(p).write_bytes(b"mp4")
+        self.assertEqual([e["filename"] for e in SL.BFSShowVideoFile().show(video_path=upper)["ui"]["images"]],
+                         ["UP.MP4", "UP_comparison.mp4"])
+
+    def test_nothing_to_show_is_quiet(self):
+        elsewhere = tempfile.TemporaryDirectory()   # system temp: not under the output folder
+        self.addCleanup(elsewhere.cleanup)
+        outside = os.path.join(elsewhere.name, "elsewhere.mp4")
+        Path(outside).write_bytes(b"mp4")
+        d = tempfile.mkdtemp(dir=_TMP)
+        for path in ("", "   ", None, ["not", "a", "path"], os.path.join(d, "missing.mp4"), outside):
+            self.assertEqual(SL.BFSShowVideoFile().show(video_path=path), {"ui": {"images": []}})
+
+    def test_registered_as_an_output_node(self):
+        cls = SL.BFSShowVideoFile
+        self.assertIs(SL.NODE_CLASS_MAPPINGS["BFSShowVideoFile"], cls)
+        self.assertEqual(SL.NODE_DISPLAY_NAME_MAPPINGS["BFSShowVideoFile"], "BFS Show Video File")
+        self.assertIs(cls.OUTPUT_NODE, True)
+        self.assertEqual(cls.RETURN_TYPES, ())
+        spec = cls.INPUT_TYPES()["required"]["video_path"]
+        self.assertEqual(spec[0], "STRING")
+        self.assertIs(spec[1]["forceInput"], True)
+        self.assertEqual(cls.CATEGORY, "BFS/shot loop")
+        self.assertNotIn("BFSShowVideoFile", SL.REENCODERS)
+
+    def test_shows_what_the_join_wrote(self):
+        d = tempfile.mkdtemp(dir=_TMP)
+        imgs = [torch.full((22, 32, 32, 3), 0.2), torch.full((39, 32, 32, 3), 0.8)]
+        shots = [_shot(0, 0, 20, gen=22), _shot(1, 20, 45, cut=True, gen=39)]
+        with patch.object(SL, "_next_output_path", lambda prefix: os.path.join(d, prefix + "_00001.mp4")):
+            out = SL.BFSShotJoin().join(imgs, shots, [0], save_to=[SL.SAVE_TO[1]], filename_prefix=["test"],
+                                        comparison=[True])
+        self.assertIsInstance(out, tuple)   # the join itself still shows nothing (1.112.0)
+        ui = SL.BFSShowVideoFile().show(video_path=out[4])["ui"]
+        sub = os.path.basename(d)
+        self.assertEqual(ui["images"], [self._entry("test_00001.mp4", sub), self._entry("test_00001_comparison.mp4", sub)])
+        self.assertEqual(ui["animated"], (True,))
+        images_mode = SL.BFSShotJoin().join(imgs, shots, [0])   # save_to = images: no file, nothing to show
+        self.assertEqual(images_mode[4], "")
+        self.assertEqual(SL.BFSShowVideoFile().show(video_path=images_mode[4]), {"ui": {"images": []}})
+
+
 class StoredComparisonTest(unittest.TestCase):
     def test_originals_go_to_a_video_not_the_pt(self):
         rid = "cmp_" + str(id(self))

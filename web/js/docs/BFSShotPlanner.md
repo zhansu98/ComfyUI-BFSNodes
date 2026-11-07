@@ -22,6 +22,7 @@ every shot inside that range.
 | **BFS Shot H3 Conditioning** | The common MiniMax H3 path with the important controls only: aligned Add Guide and/or native video reference, references, optional audio conditioning, the Planner's inpaint mode and source-subject blur. |
 | **BFS Shot H3 Conditioning (Advanced)** | The full conditioning node. Adds the setting reference, the first-frame anchor and the experimental mask-guide controls; its `model` input passes through to `model` (older workflows routed the model through it). The duet lives in **BFS Shot H3 Duet** (1.113 took it out of this node). |
 | **BFS Shot Join** | Concatenates the decoded shots in order, trims each to its true length, cross-fades soft joins and returns the soundtrack. With *comparison* on it also returns a side-by-side video (original shot \| references \| result) with the shot's info and your *label* on top and its prompt below, ready for Create Video. *save to = mp4 file* writes the video (and the comparison) straight to MP4 files instead, one shot in memory at a time (long videos); `video_path` gives the file. |
+| **BFS Show Video File** | Shows an MP4 the join wrote (connect `video_path`) on the node and in ComfyUI's queue / assets list and history, like Save Video does, without encoding it again. With *comparison* on it also shows `<name>_comparison.mp4`. Nothing to show with *save to = images* (empty path). |
 | **BFS Shot H3 Duet** | Renders one shot with H3: the shot's clip pinned beside the video (duet, no LoRA), the shot as an aligned guide (for body-swap LoRAs), or both. |
 
 ## The panel
@@ -100,7 +101,9 @@ Three run modes:
   says so in the console, instead of the whole ComfyUI being killed.
 - **The outputs are never empty:** with *mp4 file* (chosen or by the RAM guard) the `images` and `comparison` outputs
   still carry the video, read back from the written files at a size that fits the free RAM (the console says the
-  scale; the files keep the full size), the join shows the files on its node, and `video_path` gives the path.
+  scale; the files keep the full size), and `video_path` gives the path; connect it to **BFS Show Video File** to see
+  the file on a node and in ComfyUI's outputs (queue / assets list) without a second encode (a Video Combine / Save
+  Video after the join encodes the whole video again).
 - **Default: save_to = images** (the result comes out inside ComfyUI, for the next nodes). The panel's Checks warn when
   the video is long for this machine (as images it needs about 12 bytes per pixel per frame, ~3.5x with the
   comparison, against the free RAM) and advise *mp4 file* for that video.

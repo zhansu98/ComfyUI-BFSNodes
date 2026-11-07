@@ -4713,7 +4713,8 @@ class BFSShotJoin:
                              "writes the video (and the comparison) straight to MP4 files in the output folder, one shot "
                              "at a time, so memory stays at about one shot: use it for long videos. The images and comparison "
                              "outputs still carry the video, read back from the files at a size that fits the free RAM "
-                             "(the files keep the full size), the node shows the files, and video_path gives the path. "
+                             "(the files keep the full size), and video_path gives the path: connect it to BFS Show "
+                             "Video File to see the file on a node and in ComfyUI's outputs. "
                              "In mp4 file mode, bypass downstream VHS Video Combine / Create Video / Save Video nodes: "
                              "they only encode the completed video again and can exhaust RAM."}),
                          "filename_prefix": ("STRING", {"default": "bfs_shot_loop", "tooltip":
@@ -5654,6 +5655,58 @@ def shot_seed(seed: int, index: int, mode: str, overrides: str = "") -> int:
     return seed
 
 
+class BFSShowVideoFile:
+    """Show an MP4 that is already in the output folder (BFS Shot Join's `video_path` in mp4 file mode) on the node
+    and in ComfyUI's outputs (queue / assets list, history) without encoding it again: the same report Save Video
+    makes, for a file another node wrote. A separate output node, so the join itself keeps returning plain outputs
+    (no UI on a node that also expands the graph in the shot-by-shot run)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"video_path": ("STRING", {"forceInput": True, "tooltip":
+                "Path of an MP4 inside the output folder, e.g. BFS Shot Join's video_path (empty when the join ran "
+                "with save_to = images: nothing is shown)."})},
+            "optional": {"comparison": ("BOOLEAN", {"default": True, "tooltip":
+                "Also show <name>_comparison.mp4 next to it when the join wrote one."})},
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "show"
+    CATEGORY = "BFS/shot loop"
+    DESCRIPTION = ("Report an MP4 the join already wrote (video_path) to ComfyUI's outputs and show it on the node, "
+                   "without encoding the video again.")
+
+    def show(self, video_path="", comparison=True):
+        files = []
+        path = str(video_path or "").strip()
+        if not path:
+            print("[BFS Show Video File] no video_path (the join ran with save_to = images?): nothing to show",
+                  flush=True)
+        else:
+            root = os.path.abspath(_output_root())
+            p = os.path.abspath(path if os.path.isabs(path) else os.path.join(root, path))
+            try:
+                inside = os.path.commonpath([root, p]) == root
+            except ValueError:   # another drive on Windows
+                inside = False
+            if not inside:
+                print(f"[BFS Show Video File] {path} is not inside the output folder: not shown", flush=True)
+            elif not os.path.isfile(p):
+                print(f"[BFS Show Video File] {path} is not there: not shown", flush=True)
+            else:
+                comp = p[:-4] + "_comparison.mp4" if comparison and p.lower().endswith(".mp4") else None
+                for q in (p, comp):
+                    if q and os.path.isfile(q):
+                        sub = os.path.relpath(os.path.dirname(q), root)
+                        files.append({"filename": os.path.basename(q), "subfolder": "" if sub == "." else sub,
+                                      "type": "output"})
+        if not files:   # never raise: the run is finished and the file (if any) is on disk
+            return {"ui": {"images": []}}
+        return {"ui": {"images": files, "animated": (True,)}}
+
+
 NODE_CLASS_MAPPINGS = {
     "BFSShotPlanner": BFSShotPlanner,
     "BFSShotUnpack": BFSShotUnpack,
@@ -5662,6 +5715,7 @@ NODE_CLASS_MAPPINGS = {
     "BFSShotH3ConditioningSimple": BFSShotH3ConditioningSimple,
     "BFSShotJoin": BFSShotJoin,
     "BFSShotSeed": BFSShotSeed,
+    "BFSShowVideoFile": BFSShowVideoFile,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BFSShotPlanner": "BFS Shot Planner",
@@ -5671,6 +5725,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BFSShotH3ConditioningSimple": "BFS Shot H3 Conditioning",
     "BFSShotJoin": "BFS Shot Join",
     "BFSShotSeed": "BFS Shot Seed",
+    "BFSShowVideoFile": "BFS Show Video File",
 }
 
 # ---------------------------------------------------------------------------- chunked uploads
