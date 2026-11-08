@@ -1807,10 +1807,24 @@ Answer with one JSON object only, no code fence:
 
 
 async def _off_loop(fn):
-    """Run slow work in a thread so the server keeps answering (and the panel gets progress events)."""
+    """Run slow work in a thread so the server keeps answering (and the panel gets progress events). The thread runs
+    in torch.inference_mode(), as ComfyUI runs a node: a model a run loaded holds inference tensors, which PyTorch
+    refuses to use outside it ('Inference tensors do not track version counter')."""
     import asyncio
     _outside_prompt()
-    return await asyncio.get_running_loop().run_in_executor(None, fn)
+
+    def run():
+        with torch.inference_mode():
+            return fn()
+    return await asyncio.get_running_loop().run_in_executor(None, run)
+
+
+def _route_error(exc: BaseException) -> dict:
+    """A panel request failed: the panel shows the one-line message, the ComfyUI console gets the traceback."""
+    import traceback
+    print("[BFS Shot Planner] a panel request failed:\n"
+          + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
+    return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def _outside_prompt() -> None:
@@ -5965,7 +5979,7 @@ try:
         try:
             a = await _off_loop(lambda: analyze(_input_path(name), fps))
         except Exception as exc:  # noqa: BLE001 - the panel shows the reason
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response(a)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/plan")
@@ -5988,7 +6002,7 @@ try:
             a, segs, cuts, used = await _off_loop(work)
             W, H = plan_generation_size(a["width"], a["height"], p, int(p["multiple"]))
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response({"segs": segs, "cuts": cuts, "width": W, "height": H, "detector": used,
                                   "max_len": snap_down(int(round(float(p["max_s"]) * float(p["fps"]))), p["grid"])})
     @PromptServer.instance.routes.post("/bfs/shotloop/filters")
@@ -6009,7 +6023,7 @@ try:
                 return segs
             segs = await _off_loop(work)
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response({"segs": [{"start": s["start"], "end": s["end"], "stats": s["stats"],
                                             "skip_reason": s["skip_reason"]} for s in segs]})
 
@@ -6027,7 +6041,7 @@ try:
             fr = _read_frames(path, src[[f]], (w, h))[0]
             ok, buf = cv2.imencode(".jpg", cv2.cvtColor(fr, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.Response(body=buf.tobytes(), content_type="image/jpeg")
 
     @PromptServer.instance.routes.post("/bfs/shotloop/mask")
@@ -6046,17 +6060,15 @@ try:
                             "padding", "expand", "feather", "paste"):
                     if key in mask_override:
                         spec[key] = mask_override[key]
-            import asyncio   # SAM 3 takes seconds: keep the server responsive
-            _outside_prompt()
             preview_color = (mask_override or {}).get("preview_color") or (
                 seg.get("color_guide_color") if seg.get("color_guide") else "#ff283c")
-            out = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec,
+            out = await _off_loop(   # SAM 3 takes seconds: keep the server responsive
+                lambda: mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec,
                                            int(body.get("count", 6)),
                                            preview_color,
                                            seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55))
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response(out)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/vlm")
@@ -6071,13 +6083,11 @@ try:
             want = body.get("indices")
             pick = [segs[i] for i in want] if want else segs
             cfg = vlm_cfg(p.get("vlm_cfg"))
-            import asyncio
-            _outside_prompt()
-            out = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: [dict(vlm_shot(clip, path, a, s["start"], s["end"], cfg), start=s["start"], end=s["end"])
+            out = await _off_loop(
+                lambda: [dict(vlm_shot(clip, path, a, s["start"], s["end"], cfg), start=s["start"], end=s["end"])
                                for s in pick])
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response({"segs": out})
 
     @PromptServer.instance.routes.post("/bfs/shotloop/target")
@@ -6114,7 +6124,7 @@ try:
                         "no_vlm": clip is None, "vlm_error": why}
             out = await _off_loop(work)
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response(out)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/describe")
@@ -6138,7 +6148,7 @@ try:
                 return out
             texts = await _off_loop(work)
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response({"pictures": texts})
 
     @PromptServer.instance.routes.post("/bfs/shotloop/autoprompt")
@@ -6166,7 +6176,7 @@ try:
                 return out
             prompts = await _off_loop(work)
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response({"prompts": prompts})
 
     @PromptServer.instance.routes.post("/bfs/shotloop/cast")
@@ -6177,7 +6187,7 @@ try:
             path = _input_path(p["video"])
             c = await _off_loop(lambda: analyze_cast(path, analyze(path, float(p["fps"]))))
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
         return web.json_response({"people": c["people"], "step": c["step"], "samples": len(c["samples"])})
 
     @PromptServer.instance.routes.get("/bfs/shotloop/vram")
@@ -6185,7 +6195,7 @@ try:
         try:
             return web.json_response(vram_status())
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/progress")
     async def _bfs_shot_progress(request):
@@ -6193,7 +6203,7 @@ try:
         try:
             return web.json_response(cache_status(_load_plan(json.dumps(body.get("plan", {}))), bool(body.get("reset"))))
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/redo")
     async def _bfs_shot_redo(request):
@@ -6203,7 +6213,7 @@ try:
                                                 [int(x) for x in body.get("shots", [])], bool(body.get("cascade", True)),
                                                 bool(body.get("cancel", False))))
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/combine")
     async def _bfs_shot_combine(request):
@@ -6215,6 +6225,6 @@ try:
                 p, int(body.get("crossfade", 4)), int(body.get("crf", 17)), str(body.get("prefix") or "bfs_shot_loop")))
             return web.json_response(res)
         except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return web.json_response(_route_error(exc), status=500)
 except Exception as _exc:  # noqa: BLE001 - nodes still work without the panel
     print(f"[BFSNodes] Shot loop HTTP routes not registered: {_exc!r}")

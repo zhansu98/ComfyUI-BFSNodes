@@ -2142,3 +2142,43 @@ class PanelVlmTest(unittest.TestCase):
         src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
         self.assertEqual(src.count("id(clip)"), 1, "only _vlm_identity's fallback may use id(clip)")
         self.assertEqual(src.count("_vlm_identity(clip)"), 5)   # the definition + the four answer caches
+
+
+class PanelInferenceModeTest(unittest.TestCase):
+    """ComfyUI runs nodes inside torch.inference_mode(), so the VLM's weights and caches built during a run are
+    inference tensors. The panel's buttons run that same model in a worker thread, which must also be in inference
+    mode, or PyTorch refuses: 'Inference tensors do not track version counter' (seen after a run, 1.120.0)."""
+
+    def test_worker_runs_in_inference_mode(self):
+        import asyncio
+        self.assertTrue(asyncio.run(SL._off_loop(torch.is_inference_mode_enabled)))
+
+    def test_model_state_built_by_a_run_is_usable_from_the_panel(self):
+        import asyncio
+        with torch.inference_mode():   # what a run leaves behind (a cache the model updates in place)
+            cache = torch.zeros(4)
+
+        def generate():
+            cache.add_(1)
+            return int(cache.sum())
+        self.assertEqual(asyncio.run(SL._off_loop(generate)), 4)
+
+    def test_every_panel_worker_goes_through_off_loop(self):
+        src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
+        users = [ln for ln in src.splitlines() if "run_in_executor" in ln]
+        self.assertEqual(len(users), 2, users)   # _off_loop itself + /combine (ffmpeg only, no model)
+
+    def test_a_failed_panel_request_logs_its_traceback(self):
+        import contextlib
+        import io
+        try:
+            raise RuntimeError("Inference tensors do not track version counter.")
+        except RuntimeError as exc:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                out = SL._route_error(exc)
+        self.assertEqual(out, {"error": "RuntimeError: Inference tensors do not track version counter."})
+        self.assertIn("Traceback (most recent call last)", buf.getvalue())
+        self.assertIn("test_a_failed_panel_request_logs_its_traceback", buf.getvalue())
+        src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
+        self.assertNotIn('{"error": f"{type(exc).__name__}: {exc}"}, status=500', src)
