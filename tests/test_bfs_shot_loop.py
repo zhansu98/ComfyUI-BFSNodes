@@ -2182,3 +2182,19 @@ class PanelInferenceModeTest(unittest.TestCase):
         self.assertIn("test_a_failed_panel_request_logs_its_traceback", buf.getvalue())
         src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
         self.assertNotIn('{"error": f"{type(exc).__name__}: {exc}"}, status=500', src)
+
+
+class PanelFetchTimeoutTest(unittest.TestCase):
+    """ComfyUI frontend 1.55.18's api.fetchApi aborts a request after 60 s ('Fetch timeout') unless it passes
+    timeoutMs: null; the panel's long requests (analysis of a long video, SAM 3, the VLM, combine) must turn it off."""
+
+    LONG = ("analyze", "plan", "filters", "cast", "target", "mask", "vlm", "describe", "autoprompt", "combine")
+
+    def test_long_panel_requests_have_no_fetch_timeout(self):
+        import re
+        src = (ROOT / "web" / "js" / "bfs_shot_loop.js").read_text(encoding="utf-8")
+        self.assertRegex(src, r"\bconst NO_TIMEOUT = null;")
+        for route in self.LONG:
+            calls = [ln for ln in src.splitlines() if re.search(rf"api\.fetchApi\([\"`]/bfs/shotloop/{route}\b", ln)]
+            self.assertEqual(len(calls), 1, route)
+            self.assertIn("timeoutMs: NO_TIMEOUT", calls[0], route)
