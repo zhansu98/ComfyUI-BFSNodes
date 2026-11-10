@@ -16,11 +16,7 @@ import { createApp, ref, reactive, computed, watch, nextTick, onMounted, onBefor
 import { h, rawH, t, uiLanguage, setUiLanguage, DEFAULTS, MASK_DEFAULTS, VLM_DEFAULTS, snapUp, snapDown, segKey, hasMask, pill,
          MAX_REFS, refList, shotRefNames, MARK_PALETTE, pictureColor, markRegions, AUTO_DEFAULTS } from "./shotloop/common.js";
 import { styles } from "./shotloop/styles.js";
-
-// Newer ComfyUI frontends (1.55.18 does, 1.36.13 does not) abort an api.fetchApi call after 60 s ('Fetch timeout')
-// unless it passes timeoutMs: null. The panel's analysis, SAM 3, VLM and combine requests answer only when the work
-// is done, which takes longer than that on long videos; older frontends ignore the option.
-const NO_TIMEOUT = null;
+import { runJob } from "./shotloop/job.js";
 // history lengths H3's VAE encodes whole (17k+5); old plans saved 17/34/51, read as the next valid one up
 const historyLen = n => (n = Number(n) || 22) <= 5 ? 5 : 5 + Math.ceil((n - 5) / 17) * 17;
 import { timelineCard } from "./shotloop/view_timeline.js";
@@ -116,6 +112,8 @@ function Panel(io) {
   const showMasks = ref(true);   // overlay the mask preview on the shot cards
   const vlmSug = ref({});        // "start-end" -> {segment, shot, people, recommend, reason} from the VLM
   const modal = reactive({ open: false, idx: -1, key: 0, points: [], text: "", region: 1, groups: {}, prev: null, busy: "" });
+  // a long request runs as a server job (see shotloop/job.js): its progress also comes with each poll
+  const job = (url, init) => runJob(api, url, init, { onStatus: s => { if (busy.value || modal.busy) Object.assign(status, s); } });
   const segPeople = ref({});     // "start-end" -> {people, main} from /bfs/shotloop/plan
   const targetCrop = ref({});    // "start-end" -> data URL of the subject the description was made from
   const tab = ref(store.get("bfs.shotloop.tab", "shots"));
@@ -325,9 +323,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     if (!plan.video) return;
     busy.value = "Analysing video…";
     try {
-      const r = await api.fetchApi(`/bfs/shotloop/analyze?video=${encodeURIComponent(plan.video)}&fps=${plan.fps}`, { timeoutMs: NO_TIMEOUT });
-      const j = await r.json();
-      if (j.error) throw new Error(j.error);
+      const j = await job(`/bfs/shotloop/analyze?video=${encodeURIComponent(plan.video)}&fps=${plan.fps}`);
       an.value = j;
       await autoSplit(plan.bounds.length === 0);
       people.value = []; segPeople.value = {};
@@ -342,9 +338,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       // every detected boundary is kept (Max shots only picks how many shots run): asked for without the limit, the
       // last kept shot would otherwise have no end and run to the end of the range
       const body = { plan: { ...plan, bounds: apply ? [] : plan.bounds, max_parts: apply ? 0 : plan.max_parts } };
-      const r = await api.fetchApi("/bfs/shotloop/plan", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify(body) });
-      const j = await r.json();
-      if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/plan", { method: "POST", body: JSON.stringify(body) });
       cuts.value = j.cuts || []; detectorUsed.value = j.detector || ""; size.w = j.width; size.h = j.height;
       segPeople.value = Object.fromEntries(j.segs.filter(s => s.main !== undefined && (s.people.length || people.value.length))
         .map(s => [`${s.start}-${s.end}`, { people: s.people, main: s.main }]));
@@ -364,8 +358,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     if (!plan.video) return;
     busy.value = "Detecting people and faces…"; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/filters", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan } }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/filters", { method: "POST", body: JSON.stringify({ plan: { ...plan } }) });
       stats.value = j.segs.map(x => ({ ...x.stats, start: x.start, end: x.end, skip_reason: x.skip_reason }));
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
@@ -374,8 +367,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     if (!plan.video) return;
     busy.value = "Finding people by face…"; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/cast", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan } }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/cast", { method: "POST", body: JSON.stringify({ plan: { ...plan } }) });
       people.value = j.people || [];
     } catch (e) { error.value = String(e.message || e); busy.value = ""; return; }
     busy.value = "";
@@ -389,8 +381,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     const s = segs.value[i]; if (!s) return;
     busy.value = "Selecting the person (SAM 3) and describing them (VLM)…"; busySince.value = Date.now(); error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/target", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan }, index: i, vlm_source: await io.vlmSource?.() }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/target", { method: "POST", body: JSON.stringify({ plan: { ...plan }, index: i, vlm_source: await io.vlmSource?.() }) });
       targetCrop.value = { ...targetCrop.value, [segKey(s)]: j.crop };
       if (j.desc) setMeta(i, "target", j.desc);
       else if (j.vlm_error) error.value = `${j.vlm_error} (The SAM 3 cutout is shown below; you can type the target description yourself.)`;
@@ -405,8 +396,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     if (intoModal) { modal.busy = label; busySince.value = Date.now(); Object.assign(status, { stage: "", done: 0, total: 0 }); } else busy.value = label;
     error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/mask", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan }, index: i, mask: spec || null }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/mask", { method: "POST", body: JSON.stringify({ plan: { ...plan }, index: i, mask: spec || null }) });
       if (intoModal) modal.prev = j; else maskPrev.value = { ...maskPrev.value, [segKey(s)]: j };
     } catch (e) { error.value = String(e.message || e); }
     if (intoModal) modal.busy = ""; else busy.value = "";
@@ -540,8 +530,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   async function analyseVLM() {
     busy.value = "Asking the VLM about every shot…"; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/vlm", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan }, vlm_source: await io.vlmSource?.() }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/vlm", { method: "POST", body: JSON.stringify({ plan: { ...plan }, vlm_source: await io.vlmSource?.() }) });
       mergeSug(j.segs);
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
@@ -559,9 +548,8 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   async function describePictures(names = pictures.value.map(x => x.name)) {
     busy.value = "Describing the pictures with the VLM…"; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/describe", { method: "POST", timeoutMs: NO_TIMEOUT,
+      const j = await job("/bfs/shotloop/describe", { method: "POST",
         body: JSON.stringify({ plan: { ...plan }, pictures: names, vlm_source: await io.vlmSource?.() }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
       plan.picture_details = { ...plan.picture_details, ...j.pictures }; save();
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
@@ -586,8 +574,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   async function writePrompts(indices = segs.value.map((_, i) => i)) {
     busy.value = `Writing ${indices.length} prompt(s) with the VLM…`; error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/autoprompt", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan }, indices, vlm_source: await io.vlmSource?.() }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
+      const j = await job("/bfs/shotloop/autoprompt", { method: "POST", body: JSON.stringify({ plan: { ...plan }, indices, vlm_source: await io.vlmSource?.() }) });
       plan.auto_prompts = { ...plan.auto_prompts, ...j.prompts }; save();
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
@@ -695,12 +682,10 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   async function combine() {
     busy.value = "Combining the stored shots into an MP4";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/combine", { method: "POST", timeoutMs: NO_TIMEOUT, body: JSON.stringify({ plan: { ...plan },
+      const j = await job("/bfs/shotloop/combine", { method: "POST", body: JSON.stringify({ plan: { ...plan },
         crossfade: plan.combine_crossfade ?? 4, crf: plan.combine_crf ?? 17 }) });
-      const j = await r.json();
-      if (j.error) error.value = j.error;
-      else cache.combined = { ...j, url: api.apiURL(`/view?filename=${encodeURIComponent(j.filename)}&subfolder=${encodeURIComponent(j.subfolder)}&type=output`) };
-    } catch (e) { error.value = `${e}`; }
+      cache.combined = { ...j, url: api.apiURL(`/view?filename=${encodeURIComponent(j.filename)}&subfolder=${encodeURIComponent(j.subfolder)}&type=output`) };
+    } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
   }
   // a shot of the panel (any, skipped ones too) -> its cache state: "ok" stored and up to date, "run" runs next time

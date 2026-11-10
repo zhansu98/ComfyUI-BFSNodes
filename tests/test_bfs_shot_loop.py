@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2164,9 +2165,13 @@ class PanelInferenceModeTest(unittest.TestCase):
         self.assertEqual(asyncio.run(SL._off_loop(generate)), 4)
 
     def test_every_panel_worker_goes_through_off_loop(self):
+        import ast
         src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
         users = [ln for ln in src.splitlines() if "run_in_executor" in ln]
-        self.assertEqual(len(users), 2, users)   # _off_loop itself + /combine (ffmpeg only, no model)
+        self.assertEqual(len(users), 2, users)   # _off_loop (quick work) + _run_job (the panel's long requests)
+        owners = {f.name for f in ast.walk(ast.parse(src)) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and any(isinstance(c, ast.Attribute) and c.attr == "run_in_executor" for c in ast.walk(f))}
+        self.assertEqual(owners, {"_off_loop", "_run_job"})
 
     def test_a_failed_panel_request_logs_its_traceback(self):
         import contextlib
@@ -2184,17 +2189,519 @@ class PanelInferenceModeTest(unittest.TestCase):
         self.assertNotIn('{"error": f"{type(exc).__name__}: {exc}"}, status=500', src)
 
 
-class PanelFetchTimeoutTest(unittest.TestCase):
-    """ComfyUI frontend 1.55.18's api.fetchApi aborts a request after 60 s ('Fetch timeout') unless it passes
-    timeoutMs: null; the panel's long requests (analysis of a long video, SAM 3, the VLM, combine) must turn it off."""
+LONG_ROUTES = ("analyze", "plan", "filters", "cast", "target", "mask", "vlm", "describe", "autoprompt", "combine")
 
-    LONG = ("analyze", "plan", "filters", "cast", "target", "mask", "vlm", "describe", "autoprompt", "combine")
 
-    def test_long_panel_requests_have_no_fetch_timeout(self):
+class PanelJobTest(unittest.TestCase):
+    """The panel's long requests run as background jobs: RunPod's proxy cuts a request that has no answer after
+    ~100-120 s (and frontend 1.55.18 after 60 s), so a route answers within a short grace with the result or a job id,
+    and the panel long-polls /bfs/shotloop/job (each poll held at most _JOB_WAIT_MAX) until the job ends."""
+
+    def setUp(self):
+        SL._JOBS.clear()
+
+    @staticmethod
+    def _run(go):
+        import asyncio
+        return asyncio.run(go())
+
+    def test_a_quick_job_answers_inline(self):
+        """...at once (not after the whole grace), and a poll of a finished job answers at once too."""
+        import time
+
+        async def go():
+            t0 = time.monotonic()
+            out = await SL._run_job("t", lambda: {"x": 1}, key={"a": 1}, grace=10)
+            inline = time.monotonic() - t0
+            jid = next(iter(SL._JOBS))
+            t1 = time.monotonic()
+            polled = await SL._job_poll(jid, wait=10)
+            return out, inline, polled, time.monotonic() - t1
+        out, inline, polled, poll_s = self._run(go)
+        self.assertEqual(out, ({"x": 1}, 200))
+        self.assertLess(inline, 2.0)
+        self.assertEqual(polled, {"state": "done", "result": {"x": 1}})
+        self.assertLess(poll_s, 1.0)
+
+    def test_a_job_that_cannot_start_is_an_error_not_a_job_for_ever(self):
+        import asyncio
+
+        async def go():
+            loop = asyncio.get_running_loop()
+            with patch.object(loop, "run_in_executor", side_effect=RuntimeError("cannot schedule new futures")):
+                first = await SL._run_job("t", lambda: {}, key={"s": 1}, grace=10)
+            again = await SL._run_job("t", lambda: {"ran": 1}, key={"s": 1})   # not joined to a job that never ran
+            return first, again
+        first, again = self._run(go)
+        self.assertEqual(first, ({"error": "RuntimeError: cannot schedule new futures"}, 500))
+        self.assertEqual(again, ({"ran": 1}, 200))
+
+    def test_a_slow_job_answers_with_an_id_then_its_result(self):
+        import threading
+        import time
+        gate = threading.Event()
+
+        async def go():
+            t0 = time.monotonic()
+            payload, status = await SL._run_job("t", lambda: gate.wait(5) and {"segs": [1]}, key={"a": 2}, grace=0.2)
+            fast = time.monotonic() - t0
+            running = await SL._job_poll(payload["bfs_job"])
+            gate.set()
+            t1 = time.monotonic()
+            done = await SL._job_poll(payload["bfs_job"], wait=5)
+            return payload, status, fast, running, done, time.monotonic() - t1
+        payload, status, fast, running, done, waited = self._run(go)
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload["bfs_job"], str)
+        self.assertLess(fast, 1.0)
+        self.assertEqual(running["state"], "running")
+        self.assertEqual(done, {"state": "done", "result": {"segs": [1]}})
+        self.assertLess(waited, 2.0)   # the long poll answers as soon as the job ends
+
+    def test_a_poll_is_never_held_longer_than_the_cap(self):
+        import threading
+        import time
+        gate = threading.Event()
+
+        async def go():
+            payload, _ = await SL._run_job("t", lambda: gate.wait(5), key={"a": 3}, grace=0.05)
+            t0 = time.monotonic()
+            with patch.object(SL, "_JOB_WAIT_MAX", 0.3):
+                out = await SL._job_poll(payload["bfs_job"], wait=60)
+            held = time.monotonic() - t0
+            gate.set()
+            await SL._job_poll(payload["bfs_job"], wait=5)
+            return out, held
+        out, held = self._run(go)
+        self.assertEqual(out["state"], "running")
+        self.assertLess(held, 1.5)
+
+    def test_model_work_runs_in_inference_mode_and_combine_does_not(self):
+        async def go():
+            on = await SL._run_job("t", torch.is_inference_mode_enabled, key={"a": 4})
+            off = await SL._run_job("t", torch.is_inference_mode_enabled, key={"a": 5}, inference=False)
+            return on, off
+        self.assertEqual(self._run(go), ((True, 200), (False, 200)))
+
+    def test_a_failed_job_reports_the_error_and_logs_one_traceback(self):
+        import contextlib
+        import io
+        import threading
+        gate = threading.Event()
+
+        def bad():
+            raise ValueError("nope")
+
+        def slow_bad():
+            gate.wait(5)
+            bad()
+
+        async def go():
+            inline = await SL._run_job("t", bad, key={"a": 6})
+            payload, _ = await SL._run_job("t", slow_bad, key={"a": 7}, grace=0.05)
+            gate.set()
+            return inline, await SL._job_poll(payload["bfs_job"], wait=5)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            inline, polled = self._run(go)
+        self.assertEqual(inline, ({"error": "ValueError: nope"}, 500))
+        self.assertEqual(polled, {"state": "error", "error": "ValueError: nope"})
+        self.assertEqual(buf.getvalue().count("Traceback (most recent call last)"), 2)   # one per failed job
+
+    def test_identical_running_requests_share_one_job(self):
+        import threading
+        gate, calls = threading.Event(), []
+
+        def work():
+            calls.append(1)
+            gate.wait(5)
+            return {"n": len(calls)}
+
+        async def go():
+            a, _ = await SL._run_job("t", work, key={"plan": 1}, grace=0.05)
+            b, _ = await SL._run_job("t", work, key={"plan": 1}, grace=0.05)   # a second click / a page reload
+            c, _ = await SL._run_job("t", work, key={"plan": 2}, grace=0.05)   # other settings: its own job
+            gate.set()
+            done = await SL._job_poll(a["bfs_job"], wait=5)
+            await SL._job_poll(c["bfs_job"], wait=5)
+            again = await SL._run_job("t", work, key={"plan": 1})              # finished jobs are never reused
+            return a, b, c, done, again
+        a, b, c, done, again = self._run(go)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(again, ({"n": 3}, 200))
+        self.assertEqual(len(calls), 3)
+
+    def test_an_unknown_job_is_lost(self):
+        async def go():
+            return await SL._job_poll("no-such-job")
+        out = self._run(go)
+        self.assertEqual(out["state"], "lost")
+        self.assertIn("restarted", out["error"])
+
+    def test_finished_jobs_are_pruned_by_age_and_count(self):
+        async def go():
+            with patch.object(SL, "_JOB_KEEP", 3):
+                for i in range(6):
+                    await SL._run_job("t", lambda: {}, key={"i": i})
+                kept = len(SL._JOBS)
+            with patch.object(SL, "_JOB_TTL", 0.0):
+                await SL._run_job("t", lambda: {}, key={"i": 99})
+                await SL._job_poll("prune")
+                aged = len(SL._JOBS)
+            return kept, aged
+        kept, aged = self._run(go)
+        self.assertLessEqual(kept, 4)   # the cap holds (+ the job that just finished)
+        self.assertEqual(aged, 0)
+
+    def test_a_poll_from_another_event_loop_is_woken_and_capped(self):
+        """A job is woken through each waiter's own loop (thread-safe), so a poll on another loop neither hangs past
+        its cap nor misses the end (asyncio debug mode turns a cross-loop wake into an error)."""
+        import asyncio
+        import threading
+        import time
+        gate, started, out = threading.Event(), threading.Event(), {}
+
+        def loop_a():
+            async def go():
+                payload, _ = await SL._run_job("t", lambda: gate.wait(5) and {"r": 1}, key={"x": 1}, grace=0.05)
+                out["id"] = payload["bfs_job"]
+                started.set()
+                await asyncio.sleep(3)   # keep loop A alive while B polls
+            asyncio.run(go(), debug=True)
+        a = threading.Thread(target=loop_a)
+        a.start()
+        self.assertTrue(started.wait(5))
+
+        async def poll_b():
+            with patch.object(SL, "_JOB_WAIT_MAX", 0.2):
+                t0 = time.monotonic()
+                capped = await SL._job_poll(out["id"], wait=60)
+                held = time.monotonic() - t0
+            threading.Timer(0.2, gate.set).start()
+            t1 = time.monotonic()
+            done = await SL._job_poll(out["id"], wait=5)
+            return capped, held, done, time.monotonic() - t1
+        capped, held, done, woke = asyncio.run(poll_b(), debug=True)
+        a.join(10)
+        self.assertEqual(capped["state"], "running")
+        self.assertLess(held, 1.0)
+        self.assertEqual(done, {"state": "done", "result": {"r": 1}})
+        self.assertLess(woke, 2.0)
+
+    def test_a_job_is_joinable_as_soon_as_it_is_listed(self):
+        """A request that joins a job listed by another request whose worker has not started yet (two identical
+        requests interleaved) waits on it like any other, and is woken when it ends."""
+        import threading
+
+        async def go():
+            listed = SL._new_job("t", SL._job_sig("t", {"j": 1}))   # listed, worker not submitted yet
+            with SL._JOBS_LOCK:
+                SL._JOBS[listed["id"]] = listed
+            joined, status = await SL._run_job("t", lambda: {"other": 1}, key={"j": 1}, grace=0.05)
+            threading.Timer(0.1, lambda: SL._finish_job(listed, result={"ok": 1})).start()
+            return joined, status, listed["id"], await SL._job_poll(listed["id"], wait=5)
+        joined, status, jid, done = self._run(go)
+        self.assertEqual((joined, status), ({"bfs_job": jid}, 200))
+        self.assertEqual(done, {"state": "done", "result": {"ok": 1}})
+
+    def test_a_wait_that_times_out_or_is_cancelled_leaves_no_waiter(self):
+        import asyncio
+        import threading
+        gate = threading.Event()
+
+        async def go():
+            payload, _ = await SL._run_job("t", lambda: gate.wait(5) and {}, key={"w": 1}, grace=0.05)
+            job = SL._JOBS[payload["bfs_job"]]
+            await SL._job_poll(job["id"], wait=0.05)                       # timed out
+            task = asyncio.create_task(SL._job_poll(job["id"], wait=5))   # the client goes away mid-poll
+            await asyncio.sleep(0.05)
+            left_while_waiting = len(job["waiters"])
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            left = len(job["waiters"])
+            gate.set()
+            done = await SL._job_poll(job["id"], wait=5)
+            return left_while_waiting, left, done["state"]
+        self.assertEqual(self._run(go), (1, 0, "done"))   # the cancelled poll did not cancel the job
+
+    def test_a_failure_is_reported_even_if_logging_it_fails(self):
+        """The error is recorded before the traceback is printed: a console that cannot print it (cp1252 and an
+        emoji in the message) must not turn the failure into a success with no result."""
+        def bad():
+            raise ValueError("Select the person first: 🎯 Points…")
+
+        def broken_log(exc):
+            raise UnicodeEncodeError("charmap", "🎯", 0, 1, "character maps to <undefined>")
+
+        async def go():
+            with patch.object(SL, "_route_error", broken_log):
+                return await SL._run_job("t", bad, key={"e": 1})
+        self.assertEqual(self._run(go), ({"error": "ValueError: Select the person first: 🎯 Points…"}, 500))
+
+    def test_the_poll_carries_the_jobs_progress(self):
+        import threading
+        gate = threading.Event()
+
+        def work():
+            SL._status("Reading the video", 3, 10, force=True)
+            gate.wait(5)
+            return {}
+
+        async def go():
+            import asyncio
+            payload, _ = await SL._run_job("t", work, key={"a": 8}, grace=0.05)
+            await asyncio.sleep(0.1)
+            out = await SL._job_poll(payload["bfs_job"])
+            gate.set()
+            await SL._job_poll(payload["bfs_job"], wait=5)
+            return out
+        out = self._run(go)
+        self.assertEqual(out["status"], {"stage": "Reading the video", "done": 3, "total": 10})
+
+
+def _loop_thread_calls(src: str, handler: str) -> set:
+    """The calls a route handler makes on the event-loop thread (outside the nested def / lambda it hands a worker)."""
+    import ast
+
+    def walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(child, ast.Call):
+                f = child.func
+                yield f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else "?"
+            yield from walk(child)
+    fn = next(f for f in ast.walk(ast.parse(src)) if isinstance(f, ast.AsyncFunctionDef) and f.name == handler)
+    return {name for stmt in fn.body for name in walk(ast.Module(body=[stmt], type_ignores=[]))}   # not the decorator
+
+
+class PanelRouteGuardTest(unittest.TestCase):
+    """Nothing slow on a long route's request path: a first analyze() decodes the whole video, which held the request
+    open (and froze the server) past the proxy's limit."""
+
+    ALLOWED = {"json", "get", "float", "_job"}
+
+    def test_long_routes_only_parse_the_request_and_start_a_job(self):
+        src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
+        for route in LONG_ROUTES:
+            calls = _loop_thread_calls(src, f"_bfs_shot_{route}")
+            self.assertIn("_job", calls, route)
+            self.assertLessEqual(calls, self.ALLOWED, route)
+
+    def test_frame_decodes_off_the_loop(self):
+        src = (ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8")
+        calls = _loop_thread_calls(src, "_bfs_shot_frame")   # all reading and encoding inside work()
+        self.assertIn("_off_loop", calls)
+        self.assertLessEqual(calls, {"_off_loop", "json_response", "_route_error", "Response", "tobytes"}, calls)
+
+    def test_each_route_starts_its_own_kind_keyed_by_its_request(self):
+        """The key decides which requests share a job: the whole body (another shot / other settings = another job);
+        only combine (ffmpeg, no model) runs outside inference mode."""
+        import ast
+        tree = ast.parse((ROOT / "bfs_shot_loop.py").read_text(encoding="utf-8"))
+        handlers = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef)}
+        for route in LONG_ROUTES:
+            calls = [c for c in ast.walk(handlers[f"_bfs_shot_{route}"]) if isinstance(c, ast.Call)
+                     and isinstance(c.func, ast.Name) and c.func.id == "_job"]
+            self.assertEqual(len(calls), 1, route)
+            c = calls[0]
+            self.assertEqual(ast.literal_eval(c.args[0]), route)
+            if route == "analyze":   # the video and fps asked for: another fps is another analysis
+                self.assertEqual(ast.unparse(c.args[2]), "{'video': name, 'fps': fps}")
+                q = {ast.unparse(t.targets[0]): ast.unparse(t.value) for t in handlers["_bfs_shot_analyze"].body
+                     if isinstance(t, ast.Assign)}
+                self.assertEqual(q, {"name": "request.query.get('video', '')", "fps": "request.query.get('fps', '24')"})
+            else:
+                self.assertEqual(ast.unparse(c.args[2]), "body", route)
+            kw = {k.arg: ast.unparse(k.value) for k in c.keywords}
+            self.assertEqual(kw, {"inference": "False"} if route == "combine" else {}, route)
+
+    def test_planted_violation_is_reported(self):
+        planted = ("async def _bfs_shot_vlm(request):\n    body = await request.json()\n"
+                   "    a = analyze(body['p'], 24.0)\n    def work():\n        return resolve_plan(a)\n"
+                   "    return await _job('vlm', work, body)\n")
+        calls = _loop_thread_calls(planted, "_bfs_shot_vlm")
+        self.assertIn("analyze", calls)
+        self.assertNotIn("resolve_plan", calls)   # inside work(): runs in the job
+        self.assertFalse(calls <= self.ALLOWED)
+
+
+def _long_call_problems(src: str) -> list:
+    import re
+    out = []
+    for route in LONG_ROUTES:
+        lines = [ln for ln in src.splitlines() if re.search(rf"[\"`]/bfs/shotloop/{route}\b", ln)]
+        if len(lines) != 1:
+            out.append(f"{route}: {len(lines)} call lines")
+        for ln in lines:
+            if "api.fetchApi(" in ln or not re.search(r"\bjob\(", ln):
+                out.append(f"{route}: not started through job(): {ln.strip()}")
+    return out
+
+
+class PanelJobClientTest(unittest.TestCase):
+    """The panel starts each long request through job() (web/js/shotloop/job.js runJob), which follows the server job
+    until it ends, instead of one api.fetchApi that waits for the whole work."""
+
+    def test_long_requests_go_through_job(self):
+        src = (ROOT / "web" / "js" / "bfs_shot_loop.js").read_text(encoding="utf-8")
+        self.assertEqual(_long_call_problems(src), [])
+        self.assertIn('import { runJob } from "./shotloop/job.js";', src)
+        self.assertRegex(src, r"\n  const job = \(url, init\) => runJob\(api, url, init, ")   # job() is runJob
+        self.assertNotIn("timeoutMs", src)
+        self.assertNotIn("NO_TIMEOUT", src)
+
+    def test_planted_direct_fetch_is_reported(self):
         import re
         src = (ROOT / "web" / "js" / "bfs_shot_loop.js").read_text(encoding="utf-8")
-        self.assertRegex(src, r"\bconst NO_TIMEOUT = null;")
-        for route in self.LONG:
-            calls = [ln for ln in src.splitlines() if re.search(rf"api\.fetchApi\([\"`]/bfs/shotloop/{route}\b", ln)]
-            self.assertEqual(len(calls), 1, route)
-            self.assertIn("timeoutMs: NO_TIMEOUT", calls[0], route)
+        # the real vlm call line swapped for a direct fetch: one line still, so only the fetchApi check can catch it
+        planted = re.sub(r'const j = await job\("/bfs/shotloop/vlm", ', 'const r = await api.fetchApi("/bfs/shotloop/vlm", ', src)
+        self.assertNotEqual(planted, src)
+        self.assertTrue(any(p.startswith("vlm: not started through job()") for p in _long_call_problems(planted)))
+        self.assertFalse(any(p.startswith("vlm: ") and "call lines" in p for p in _long_call_problems(planted)))
+
+
+class PanelRoutesHttpTest(unittest.TestCase):
+    """The long routes over real HTTP (aiohttp, a stub PromptServer): what each one starts, and what comes back."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from aiohttp import web  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("aiohttp is not installed")
+        cls.routes = web.RouteTableDef()
+        srv = types.ModuleType("server")
+        srv.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=cls.routes, send_sync=lambda *a: None))
+        old = sys.modules.get("server")
+        sys.modules["server"] = srv
+        try:
+            spec = importlib.util.spec_from_file_location("bfs_shot_loop_http", ROOT / "bfs_shot_loop.py")
+            cls.M = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.M)
+        finally:
+            if old is None:
+                sys.modules.pop("server", None)
+            else:
+                sys.modules["server"] = old
+        (Path(_TMP) / "http.mp4").write_bytes(b"x")
+
+    def _serve(self, go):
+        import asyncio
+        from aiohttp import ClientSession, web
+
+        async def main():
+            app = web.Application()
+            app.add_routes(self.routes)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            try:
+                async with ClientSession() as s:
+                    return await go(s, f"http://127.0.0.1:{port}")
+            finally:
+                await runner.cleanup()
+        self.M._JOBS.clear()
+        return asyncio.run(main())
+
+    @staticmethod
+    async def _follow(s, base, r):
+        j = await r.json()
+        while isinstance(j, dict) and "bfs_job" in j:
+            p = await (await s.get(f"{base}/bfs/shotloop/job?id={j['bfs_job']}&wait=5")).json()
+            if p["state"] != "running":
+                return p.get("result", p)
+        return j
+
+    def test_analysis_runs_in_inference_mode_and_combine_outside_it(self):
+        M = self.M
+        with patch.object(M, "analyze", lambda path, fps: {"inference": torch.is_inference_mode_enabled(), "fps": fps}), \
+             patch.object(M, "combine_stored", lambda p, cf, crf, prefix: {"inference": torch.is_inference_mode_enabled(),
+                                                                           "crf": crf, "prefix": prefix}):
+            async def go(s, base):
+                a = await self._follow(s, base, await s.get(f"{base}/bfs/shotloop/analyze?video=http.mp4&fps=25"))
+                c = await self._follow(s, base, await s.post(f"{base}/bfs/shotloop/combine", json={"plan": {}, "crf": 17}))
+                return a, c
+            a, c = self._serve(go)
+        self.assertEqual(a, {"inference": True, "fps": 25.0})
+        self.assertEqual(c, {"inference": False, "crf": 17, "prefix": "bfs_shot_loop"})
+
+    def test_two_shots_previewed_at_once_get_their_own_results(self):
+        import time
+        M = self.M
+        segs = [{"start": 0, "end": 10, "mask": {}}, {"start": 10, "end": 20, "mask": {}}]
+
+        def preview(path, a, start, length, spec, count, color, opacity):
+            time.sleep(2.5)   # past the grace: both run as jobs at the same time
+            return {"start": start}
+        with patch.object(M, "analyze", lambda path, fps: {}), patch.object(M, "resolve_plan", lambda p, a, path: segs), \
+             patch.object(M, "plan_spec", lambda p, m, path: {}), patch.object(M, "mask_preview", preview):
+            async def go(s, base):
+                import asyncio
+                plan = {"video": "http.mp4"}
+                r0, r1 = await asyncio.gather(s.post(f"{base}/bfs/shotloop/mask", json={"plan": plan, "index": 0}),
+                                              s.post(f"{base}/bfs/shotloop/mask", json={"plan": plan, "index": 1}))
+                return await self._follow(s, base, r0), await self._follow(s, base, r1)
+            out = self._serve(go)
+        self.assertEqual(out, ({"start": 0}, {"start": 10}))
+
+    def test_auto_prompt_answers_as_before(self):
+        M = self.M
+        segs = [{"start": 0, "end": 10, "refs": [], "prompt": "p"}]
+        with patch.object(M, "analyze", lambda path, fps: {}), patch.object(M, "resolve_plan", lambda p, a, path: segs), \
+             patch.object(M, "panel_vlm", lambda source=None, required=True: "clip"), \
+             patch.object(M, "auto_prompt_shot", lambda *a, **k: {"text": "written", "for": "x"}):
+            async def go(s, base):
+                r = await s.post(f"{base}/bfs/shotloop/autoprompt", json={"plan": {"video": "http.mp4"}, "indices": [0]})
+                return r.status, await self._follow(s, base, r)
+            status, out = self._serve(go)
+        self.assertEqual((status, out), (200, {"prompts": {"0-10": {"text": "written", "for": "x"}}}))
+
+    def test_a_frame_needs_no_analysis(self):
+        """The points window's frame reads the video's header only: a first analysis (the whole video) would hold
+        the request past the proxy's limit after a restart."""
+        import numpy as np
+        M = self.M
+        called = []
+        probe = {"fps_src": 25.0, "n_src": 100, "width": 64, "height": 36, "duration": 4.0}
+        fake_cv2 = types.SimpleNamespace(imencode=lambda ext, img, params: (True, np.frombuffer(b"jpg", np.uint8)),
+                                         cvtColor=lambda img, code: img, COLOR_RGB2BGR=4, IMWRITE_JPEG_QUALITY=1)
+        reads = []
+        with patch.object(M, "analyze", lambda *a, **k: called.append(1)), patch.object(M, "_probe", lambda path: probe), \
+             patch.object(M, "_read_frames", lambda path, idx, size: reads.append((int(idx[0]), size)) or [np.zeros((size[1], size[0], 3), np.uint8)]), \
+             patch.dict(sys.modules, {"cv2": fake_cv2}):
+            async def go(s, base):
+                out = []
+                for q in ("fps=24&f=50&w=64", "fps=24&f=5000&w=128", "f=0"):
+                    r = await s.get(f"{base}/bfs/shotloop/frame?video=http.mp4&{q}")
+                    out.append((r.status, r.content_type))
+                return out
+            self.assertEqual(self._serve(go), [(200, "image/jpeg")] * 3)
+        self.assertEqual(called, [])   # no analysis (the whole video): only the asked-for frame is read
+        # the old analyze-based values: timeline 100 src frames at 25 fps -> 24 fps = 96 frames; frame f -> source
+        # round(f * 25 / 24); f clamped to the timeline; h from the video's aspect; the defaults fps 24, w 960
+        self.assertEqual(reads, [(round(50 * 25 / 24), (64, 36)), (round(95 * 25 / 24), (128, 72)), (0, (960, 540))])
+
+    def test_a_poll_whose_result_cannot_be_sent_reports_an_error(self):
+        """A result that is not JSON (an object, a NaN) is an error at once, not 30 retries ending in 'lost contact'."""
+        import threading
+        M = self.M
+        gate = threading.Event()   # the worker ends only once the job id has come back (no timing assumption)
+
+        def work_nan(path, fps):
+            gate.wait(10)
+            return {"x": float("nan")}
+        with patch.object(M, "analyze", work_nan), patch.object(M, "_JOB_GRACE", 0.05):
+            async def go(s, base):
+                j = await (await s.get(f"{base}/bfs/shotloop/analyze?video=http.mp4&fps=24")).json()
+                gate.set()
+                r = await s.get(f"{base}/bfs/shotloop/job?id={j['bfs_job']}&wait=5")
+                return r.status, await r.json()
+            status, p = self._serve(go)
+        self.assertEqual(status, 200)
+        self.assertEqual(p["state"], "error")
+        self.assertIn("ValueError", p["error"])

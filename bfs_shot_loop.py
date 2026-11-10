@@ -111,8 +111,12 @@ _STATUS_T = [0.0]
 
 
 def _status(stage: str, done: int = 0, total: int = 0, force: bool = False) -> None:
-    """Progress for the planner panel's loading bar (throttled)."""
+    """Progress for the planner panel's loading bar (throttled). Inside a panel job it is also kept on the job, so the
+    panel's poll carries it when the websocket events do not arrive (a proxy that drops them, a reloaded page)."""
     import time
+    job = getattr(_JOB_LOCAL, "job", None)
+    if job is not None:
+        job["status"] = {"stage": stage, "done": int(done), "total": int(total)}
     now = time.time()
     if not force and now - _STATUS_T[0] < 0.25 and done < total:
         return
@@ -1825,6 +1829,140 @@ def _route_error(exc: BaseException) -> dict:
     print("[BFS Shot Planner] a panel request failed:\n"
           + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
     return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------- panel jobs
+# The panel's long requests (analysis of a long video, SAM 3, the VLM, combine) run as background jobs: RunPod's proxy
+# cuts a request that has had no answer for ~100-120 s, and frontend 1.55.18 aborts api.fetchApi after 60 s. A route
+# answers within _JOB_GRACE with the result (a cached analysis, a validation error: one round trip, as before) or with
+# {"bfs_job": id}; the panel then long-polls /bfs/shotloop/job, each poll held at most _JOB_WAIT_MAX.
+# Jobs run side by side on the default executor, as the routes' work did before (panel_vlm has its own locking).
+
+_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_LOCAL = threading.local()   # the job the current worker thread runs (for _status)
+_JOB_GRACE = 2.0
+_JOB_WAIT_MAX = 25.0
+_JOB_TTL = 600.0                 # finished jobs are kept this long (a poll whose answer was lost asks again)
+_JOB_KEEP = 32                   # and at most this many
+JOB_LOST = ("ComfyUI restarted (or the job expired) before this finished: click the button again.")
+
+
+def _prune_jobs() -> None:
+    import time
+    now = time.time()
+    with _JOBS_LOCK:
+        done = sorted((j for j in _JOBS.values() if j["finished"] is not None), key=lambda j: j["finished"])
+        for i, j in enumerate(done):
+            if now - j["finished"] >= _JOB_TTL or i < len(done) - _JOB_KEEP:
+                _JOBS.pop(j["id"], None)
+
+
+def _job_sig(kind: str, key) -> str:
+    return hashlib.sha1(json.dumps([kind, key], sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _new_job(kind: str, sig: str) -> dict:
+    import time
+    import uuid
+    return {"id": uuid.uuid4().hex, "kind": kind, "sig": sig, "status": {}, "result": None, "error": None,
+            "started": time.time(), "finished": None, "waiters": []}
+
+
+def _wake(fut) -> None:
+    if not fut.done():
+        fut.set_result(None)
+
+
+def _finish_job(job: dict, result=None, error: str | None = None) -> None:
+    """The job ended: store the outcome, then wake every request waiting on it, each through its own event loop
+    (the worker is another thread; an asyncio future may only be completed from its loop)."""
+    import time
+    with _JOBS_LOCK:
+        job["result"], job["error"] = result, error
+        job["finished"] = time.time()
+        waiters, job["waiters"] = job["waiters"], []
+    for loop, fut in waiters:
+        try:
+            loop.call_soon_threadsafe(_wake, fut)
+        except RuntimeError:   # that request's loop has closed
+            pass
+
+
+async def _wait_job(job: dict, timeout: float) -> None:
+    """Wait up to `timeout` s for the job to end. A cancelled wait (the client went away) leaves the job running."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    with _JOBS_LOCK:
+        if job["finished"] is not None:
+            return
+        job["waiters"].append((loop, fut))
+    try:
+        await asyncio.wait({fut}, timeout=timeout)
+    finally:
+        with _JOBS_LOCK:
+            if (loop, fut) in job["waiters"]:
+                job["waiters"].remove((loop, fut))
+
+
+async def _run_job(kind: str, fn, key=None, inference: bool = True, grace: float | None = None) -> tuple[dict, int]:
+    """Start fn() as a panel job (or join the running job of an identical request: a second click, a reloaded page)
+    and wait up to `grace` s. -> (payload, http status): the result, {"error"} (500), or {"bfs_job": id}."""
+    import asyncio
+    _outside_prompt()
+    _prune_jobs()
+    sig = _job_sig(kind, key)
+    with _JOBS_LOCK:
+        job = next((j for j in _JOBS.values() if j["sig"] == sig and j["finished"] is None), None)
+        start = job is None
+        if start:
+            job = _new_job(kind, sig)
+            _JOBS[job["id"]] = job
+    if start:
+        def run():
+            _JOB_LOCAL.job = job
+            result, error = None, None
+            try:
+                if inference:
+                    with torch.inference_mode():
+                        result = fn()
+                else:
+                    result = fn()
+            except BaseException as exc:  # noqa: BLE001 - reported to the panel, traceback to the console
+                error = f"{type(exc).__name__}: {exc}"   # recorded before logging: a console that cannot print it
+                try:                                       # must not turn the failure into an empty success
+                    _route_error(exc)
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                _JOB_LOCAL.job = None
+                _finish_job(job, result, error)
+        try:
+            asyncio.get_running_loop().run_in_executor(None, run)
+        except Exception as exc:  # noqa: BLE001 - e.g. the executor is shutting down
+            _finish_job(job, error=f"{type(exc).__name__}: {exc}")
+    await _wait_job(job, _JOB_GRACE if grace is None else grace)
+    if job["finished"] is None:
+        return {"bfs_job": job["id"]}, 200
+    if job["error"] is not None:
+        return {"error": job["error"]}, 500
+    return job["result"], 200
+
+
+async def _job_poll(job_id: str, wait: float = 0.0) -> dict:
+    """The state of a panel job, waiting up to min(wait, _JOB_WAIT_MAX) s for it to end."""
+    job = _JOBS.get(job_id)
+    if job is not None and wait > 0:
+        await _wait_job(job, min(float(wait), _JOB_WAIT_MAX))
+    _prune_jobs()
+    if job is None:
+        return {"state": "lost", "error": JOB_LOST}
+    if job["finished"] is None:
+        return {"state": "running", "status": dict(job["status"])}
+    if job["error"] is not None:
+        return {"state": "error", "error": job["error"]}
+    return {"state": "done", "result": job["result"]}
 
 
 def _outside_prompt() -> None:
@@ -5972,82 +6110,100 @@ try:
         images = _list_input(IMAGE_EXTS) if request.query.get("images") in ("1", "true") else []
         return web.json_response({"videos": _list_input(VIDEO_EXTS), "images": images})
 
+    async def _job(kind, work, key, inference=True):
+        """A long panel request runs as a job: the result when it ends within the grace, else {"bfs_job": id}."""
+        payload, status = await _run_job(kind, work, key, inference=inference)
+        return web.json_response(payload, status=status)
+
+    @PromptServer.instance.routes.get("/bfs/shotloop/job")
+    async def _bfs_shot_job(request):
+        """A panel job's state: ?id=&wait=s holds the answer until the job ends (at most _JOB_WAIT_MAX)."""
+        try:
+            wait = float(request.query.get("wait", "0") or 0)
+        except ValueError:
+            wait = 0.0
+        out = await _job_poll(request.query.get("id", ""), wait)
+        try:   # strict JSON (no NaN): a result the browser cannot read is this job's error, not a retry loop
+            text = json.dumps(out, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            text = json.dumps({"state": "error", "error": f"{type(exc).__name__}: the result cannot be sent ({exc})"})
+        return web.Response(text=text, content_type="application/json")
+
     @PromptServer.instance.routes.get("/bfs/shotloop/analyze")
     async def _bfs_shot_analyze(request):
         name = request.query.get("video", "")
-        fps = float(request.query.get("fps", "24") or 24)
-        try:
-            a = await _off_loop(lambda: analyze(_input_path(name), fps))
-        except Exception as exc:  # noqa: BLE001 - the panel shows the reason
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response(a)
+        fps = request.query.get("fps", "24")
+
+        def work():
+            return analyze(_input_path(name), float(fps or 24))
+        return await _job("analyze", work, {"video": name, "fps": fps})
 
     @PromptServer.instance.routes.post("/bfs/shotloop/plan")
     async def _bfs_shot_plan(request):
         body = await request.json()
-        try:
-            p = _load_plan(json.dumps(body.get("plan", {})))
 
-            def work():
-                a = analyze(_input_path(p["video"]), float(p["fps"]))
-                path = _input_path(p["video"])
-                if p.get("cast") or p.get("cast_split") or p.get("cast_only"):
-                    try:
-                        analyze_cast(path, a)
-                    except Exception:  # noqa: BLE001 - plan without people
-                        pass
-                segs = resolve_plan(p, a, path)
-                cuts, used = find_cuts(path, a, p.get("detector", "adaptive"), float(p["sensitivity"]))
-                return a, segs, cuts, used
-            a, segs, cuts, used = await _off_loop(work)
+        def work():
+            p = _load_plan(json.dumps(body.get("plan", {})))
+            a = analyze(_input_path(p["video"]), float(p["fps"]))
+            path = _input_path(p["video"])
+            if p.get("cast") or p.get("cast_split") or p.get("cast_only"):
+                try:
+                    analyze_cast(path, a)
+                except Exception:  # noqa: BLE001 - plan without people
+                    pass
+            segs = resolve_plan(p, a, path)
+            cuts, used = find_cuts(path, a, p.get("detector", "adaptive"), float(p["sensitivity"]))
             W, H = plan_generation_size(a["width"], a["height"], p, int(p["multiple"]))
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response({"segs": segs, "cuts": cuts, "width": W, "height": H, "detector": used,
-                                  "max_len": snap_down(int(round(float(p["max_s"]) * float(p["fps"]))), p["grid"])})
+            return {"segs": segs, "cuts": cuts, "width": W, "height": H, "detector": used,
+                    "max_len": snap_down(int(round(float(p["max_s"]) * float(p["fps"]))), p["grid"])}
+        return await _job("plan", work, body)
+
     @PromptServer.instance.routes.post("/bfs/shotloop/filters")
     async def _bfs_shot_filters(request):
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             f = dict(DEFAULT_FILTERS); f.update(p.get("filters") or {})
             path = _input_path(p["video"])
-
-            def work():
-                a = analyze(path, float(p["fps"]))
-                segs = resolve_plan(p, a, path)
-                for i, s in enumerate(segs):   # stats always, so the panel can show them before any filter is on
-                    _status("Detecting people and faces", i, len(segs))
-                    s["stats"] = shot_stats(path, a, s, int(f.get("samples") or 6))
-                    s["skip_reason"] = skip_reason(s["stats"], s["end"] - s["start"], f)
-                return segs
-            segs = await _off_loop(work)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response({"segs": [{"start": s["start"], "end": s["end"], "stats": s["stats"],
-                                            "skip_reason": s["skip_reason"]} for s in segs]})
+            a = analyze(path, float(p["fps"]))
+            segs = resolve_plan(p, a, path)
+            for i, s in enumerate(segs):   # stats always, so the panel can show them before any filter is on
+                _status("Detecting people and faces", i, len(segs))
+                s["stats"] = shot_stats(path, a, s, int(f.get("samples") or 6))
+                s["skip_reason"] = skip_reason(s["stats"], s["end"] - s["start"], f)
+            return {"segs": [{"start": s["start"], "end": s["end"], "stats": s["stats"],
+                              "skip_reason": s["skip_reason"]} for s in segs]}
+        return await _job("filters", work, body)
 
     @PromptServer.instance.routes.get("/bfs/shotloop/frame")
     async def _bfs_shot_frame(request):
-        import cv2
         q = request.rel_url.query
-        try:
+
+        def work():   # the video's header only (what analyze() takes it from): no whole-video decode on a cold start
+            import cv2
             path = _input_path(q["video"])
-            a = analyze(path, float(q.get("fps", 24)))
-            f = max(0, min(a["n"] - 1, int(q.get("f", 0))))
-            src = _timeline(a["n_src"], a["fps_src"], float(a["fps"]))
+            info = _probe(path)
+            src = _timeline(info["n_src"], info["fps_src"], float(q.get("fps", 24)))
+            f = max(0, min(len(src) - 1, int(q.get("f", 0))))
             w = int(q.get("w", 960))
-            h = max(16, int(round(w * a["height"] / max(1, a["width"]))))
+            h = max(16, int(round(w * info["height"] / max(1, info["width"]))))
+            # counted by decoding, like the SAM 3 key frame: OpenCV's seek lands on another frame in variable frame
+            # rate video (phone footage, screen recordings) while reporting the asked-for position
             fr = _read_frames(path, src[[f]], (w, h))[0]
             ok, buf = cv2.imencode(".jpg", cv2.cvtColor(fr, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
+            return buf.tobytes()
+        try:
+            jpg = await _off_loop(work)
         except Exception as exc:  # noqa: BLE001
             return web.json_response(_route_error(exc), status=500)
-        return web.Response(body=buf.tobytes(), content_type="image/jpeg")
+        return web.Response(body=jpg, content_type="image/jpeg")
 
     @PromptServer.instance.routes.post("/bfs/shotloop/mask")
     async def _bfs_shot_mask(request):
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
             a = analyze(path, float(p["fps"]))
@@ -6062,40 +6218,34 @@ try:
                         spec[key] = mask_override[key]
             preview_color = (mask_override or {}).get("preview_color") or (
                 seg.get("color_guide_color") if seg.get("color_guide") else "#ff283c")
-            out = await _off_loop(   # SAM 3 takes seconds: keep the server responsive
-                lambda: mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec,
-                                           int(body.get("count", 6)),
-                                           preview_color,
-                                           seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55))
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response(out)
+            return mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec, int(body.get("count", 6)),
+                                preview_color, seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55)
+        return await _job("mask", work, body)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/vlm")
     async def _bfs_shot_vlm(request):
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
             a = analyze(path, float(p["fps"]))
             segs = resolve_plan(p, a, path)
-            clip = await _off_loop(lambda: panel_vlm(body.get("vlm_source")))
+            clip = panel_vlm(body.get("vlm_source"))
             want = body.get("indices")
             pick = [segs[i] for i in want] if want else segs
             cfg = vlm_cfg(p.get("vlm_cfg"))
-            out = await _off_loop(
-                lambda: [dict(vlm_shot(clip, path, a, s["start"], s["end"], cfg), start=s["start"], end=s["end"])
-                               for s in pick])
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response({"segs": out})
+            return {"segs": [dict(vlm_shot(clip, path, a, s["start"], s["end"], cfg), start=s["start"], end=s["end"])
+                             for s in pick]}
+        return await _job("vlm", work, body)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/target")
     async def _bfs_shot_target(request):
         """Pick + describe who is replaced: body {plan, index, mask?} -> {desc, crop}. The subject is the shot's SAM 3
         selection (points on its key frame, else its text); the VLM, when connected, writes the description."""
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
             a = analyze(path, float(p["fps"]))
@@ -6104,91 +6254,78 @@ try:
             if not spec_has_mask(spec):
                 raise ValueError("Select the person first: 🎯 Points… (click on them), type what to segment, or give the "
                                  "shot a mask video.")
-
-            def work():
-                import cv2
-                crop = target_crop(path, a, seg["start"], seg["end"] - seg["start"], spec)
-                if crop is None:
-                    raise ValueError("SAM 3 found nothing at that selection.")
-                try:
-                    clip, why = panel_vlm(body.get("vlm_source"), required=False), ""
-                except Exception as exc:  # noqa: BLE001 - the cut-out still comes back; the user types the text
-                    clip, why = None, f"{type(exc).__name__}: {exc}"
-                tcfg = vlm_cfg(p.get("vlm_cfg"))
-                tslot = prompt_slot(seg.get("prompt") or p.get("global_prompt", ""), "{target}") if tcfg.get("fit_prompt", True) else ""
-                desc = describe_target(clip, crop, slot=tslot, temperature=float(tcfg.get("temperature") or 0),
-                                       seed=int(tcfg.get("seed") or 0),
-                                       image_max_side=int(tcfg.get("image_max_side") or 1024)) if clip is not None else ""
-                ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
-                return {"desc": desc, "crop": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode(),
-                        "no_vlm": clip is None, "vlm_error": why}
-            out = await _off_loop(work)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response(out)
+            crop = target_crop(path, a, seg["start"], seg["end"] - seg["start"], spec)
+            if crop is None:
+                raise ValueError("SAM 3 found nothing at that selection.")
+            import cv2
+            try:
+                clip, why = panel_vlm(body.get("vlm_source"), required=False), ""
+            except Exception as exc:  # noqa: BLE001 - the cut-out still comes back; the user types the text
+                clip, why = None, f"{type(exc).__name__}: {exc}"
+            tcfg = vlm_cfg(p.get("vlm_cfg"))
+            tslot = prompt_slot(seg.get("prompt") or p.get("global_prompt", ""), "{target}") if tcfg.get("fit_prompt", True) else ""
+            desc = describe_target(clip, crop, slot=tslot, temperature=float(tcfg.get("temperature") or 0),
+                                   seed=int(tcfg.get("seed") or 0),
+                                   image_max_side=int(tcfg.get("image_max_side") or 1024)) if clip is not None else ""
+            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
+            return {"desc": desc, "crop": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode(),
+                    "no_vlm": clip is None, "vlm_error": why}
+        return await _job("target", work, body)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/describe")
     async def _bfs_shot_describe(request):
         """Each picture described alone: body {plan, pictures: [name, ...]} -> {pictures: {name: text}}. With fit_prompt
         the description is written for the global prompt's sentence about that picture ({details} = picture 1)."""
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             cfg = vlm_cfg(p.get("vlm_cfg"))
             prompt = picture_markers(body.get("prompt") or p.get("global_prompt", ""))
             pictures = [str(x) for x in body.get("pictures") or [] if x]
-            clip = await _off_loop(lambda: panel_vlm(body.get("vlm_source")))
-
-            def work():
-                out = {}
-                for name in pictures:
-                    k = p["global_refs"].index(name) + 1 if name in p["global_refs"] else None
-                    marker = (k and picture_marker(prompt, k)) or picture_marker(prompt)
-                    out[name] = describe_picture(clip, _load_image(name), prompt, marker, picture_cfg(cfg, p, name))
-                return out
-            texts = await _off_loop(work)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response({"pictures": texts})
+            clip = panel_vlm(body.get("vlm_source"))
+            out = {}
+            for name in pictures:
+                k = p["global_refs"].index(name) + 1 if name in p["global_refs"] else None
+                marker = (k and picture_marker(prompt, k)) or picture_marker(prompt)
+                out[name] = describe_picture(clip, _load_image(name), prompt, marker, picture_cfg(cfg, p, name))
+            return {"pictures": out}
+        return await _job("describe", work, body)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/autoprompt")
     async def _bfs_shot_autoprompt(request):
         """🤖 Auto prompt: the VLM writes the H3 prompt of some shots: body {plan, indices} -> {prompts: {"start-end":
         {text, for}}}."""
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
             cfg = vlm_cfg(p.get("vlm_cfg"))
             details = saved_picture_details(p)
-            clip = await _off_loop(lambda: panel_vlm(body.get("vlm_source")))
-
-            def work():
-                a = analyze(path, float(p["fps"]))
-                segs = resolve_plan(p, a, path)
-                out = {}
-                for i in body.get("indices") or range(len(segs)):
-                    seg = segs[int(i)]
-                    names = shot_ref_names(seg["refs"], p["global_refs"])
-                    out[f"{seg['start']}-{seg['end']}"] = auto_prompt_shot(
-                        clip, p, a, path, seg, names, [_load_image(n) for n in names], details,
-                        seg["prompt"] or p.get("global_prompt", ""), cfg, (p.get("auto_prompt") or {}).get("template", ""))
-                return out
-            prompts = await _off_loop(work)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response({"prompts": prompts})
+            clip = panel_vlm(body.get("vlm_source"))
+            a = analyze(path, float(p["fps"]))
+            segs = resolve_plan(p, a, path)
+            out = {}
+            for i in body.get("indices") or range(len(segs)):
+                seg = segs[int(i)]
+                names = shot_ref_names(seg["refs"], p["global_refs"])
+                out[f"{seg['start']}-{seg['end']}"] = auto_prompt_shot(
+                    clip, p, a, path, seg, names, [_load_image(n) for n in names], details,
+                    seg["prompt"] or p.get("global_prompt", ""), cfg, (p.get("auto_prompt") or {}).get("template", ""))
+            return {"prompts": out}
+        return await _job("autoprompt", work, body)
 
     @PromptServer.instance.routes.post("/bfs/shotloop/cast")
     async def _bfs_shot_cast(request):
         body = await request.json()
-        try:
+
+        def work():
             p = _load_plan(json.dumps(body.get("plan", {})))
             path = _input_path(p["video"])
-            c = await _off_loop(lambda: analyze_cast(path, analyze(path, float(p["fps"]))))
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
-        return web.json_response({"people": c["people"], "step": c["step"], "samples": len(c["samples"])})
+            c = analyze_cast(path, analyze(path, float(p["fps"])))
+            return {"people": c["people"], "step": c["step"], "samples": len(c["samples"])}
+        return await _job("cast", work, body)
 
     @PromptServer.instance.routes.get("/bfs/shotloop/vram")
     async def _bfs_shot_vram(request):
@@ -6218,13 +6355,11 @@ try:
     @PromptServer.instance.routes.post("/bfs/shotloop/combine")
     async def _bfs_shot_combine(request):
         body = await request.json()
-        try:
-            import asyncio
+
+        def work():   # ffmpeg and stored shots only: no model, so outside inference mode as before
             p = _load_plan(json.dumps(body.get("plan", {})))
-            res = await asyncio.get_running_loop().run_in_executor(None, lambda: combine_stored(
-                p, int(body.get("crossfade", 4)), int(body.get("crf", 17)), str(body.get("prefix") or "bfs_shot_loop")))
-            return web.json_response(res)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(_route_error(exc), status=500)
+            return combine_stored(p, int(body.get("crossfade", 4)), int(body.get("crf", 17)),
+                                  str(body.get("prefix") or "bfs_shot_loop"))
+        return await _job("combine", work, body, inference=False)
 except Exception as _exc:  # noqa: BLE001 - nodes still work without the panel
     print(f"[BFSNodes] Shot loop HTTP routes not registered: {_exc!r}")
