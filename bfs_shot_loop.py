@@ -3479,11 +3479,16 @@ def _write_rgb_video(path: str, frames: torch.Tensor, fps: float = 24.0, storage
     if codec is None:
         return False
     n, h, w = int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2])
-    data = frames.contiguous().numpy()
+    if not frames.numel():
+        return False                   # nothing to encode (and a view with a zero in its shape cannot be cast)
+    # flat bytes: subprocess's POSIX feed slices the input and compares its progress (bytes) with len(input), and a
+    # [N,H,W,3] memoryview counts frames there, so stdin closed after the first write (Linux caps one at ~2 GiB) and a
+    # 4K shot was stored with 85 of its 124 frames
+    data = memoryview(frames.contiguous().numpy()).cast("B")
     for c in (codec, SHOT_STORAGE["lossless"]) if codec is not SHOT_STORAGE["lossless"] else (codec,):
         try:
             r = subprocess.run([VIO.ffmpeg_bin() or "ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
-                                "-r", f"{fps:g}", "-i", "-", *c, path], input=memoryview(data), capture_output=True)
+                                "-r", f"{fps:g}", "-i", "-", *c, path], input=data, capture_output=True)
             if r.returncode == 0 and os.path.getsize(path) > 0:
                 return True
         except (OSError, ValueError):

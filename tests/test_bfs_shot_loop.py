@@ -1421,6 +1421,34 @@ class ShotStoreTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(d, "shot_0000.mkv")))
         self.assertFalse(os.path.exists(os.path.join(d, "shot_0001.mkv")))   # raw: the frames are in the .pt
 
+    def test_writer_feeds_every_byte_through_a_capped_pipe(self):
+        # A 4K shot of 124 frames is 3.1 GB of rgb24. CPython's POSIX communicate() slices the input with
+        # view[offset:offset + PIPE_BUF] and closes stdin once offset >= len(input); for a multi-dimensional
+        # memoryview both count FRAMES while os.write() returns BYTES, and Linux caps one write() at 0x7ffff000 bytes.
+        # So the first write ended the feed and ffmpeg stored 85 of 124 frames (2147479552 // (3840*2176*3) == 85).
+        # Replayed here with communicate()'s own loop and a small cap.
+        frames = torch.arange(4 * 16 * 16 * 3, dtype=torch.int64).remainder(251).to(torch.uint8).view(4, 16, 16, 3)
+        cap, fed = 1000, {}
+
+        def run(cmd, input=None, **kw):            # noqa: A002 - subprocess.run's own keyword
+            view, offset, out = memoryview(input), 0, bytearray()
+            while True:
+                chunk = view[offset:offset + 4096]
+                n = min(cap, chunk.nbytes)
+                out += chunk.tobytes()[:n]
+                offset += n
+                if offset >= len(input):
+                    break
+            fed["bytes"] = bytes(out)
+            Path(cmd[-1]).write_bytes(b"x")
+            return types.SimpleNamespace(returncode=0)
+
+        path = os.path.join(tempfile.mkdtemp(dir=_TMP), "shot_0000.mkv")
+        with patch.object(SL.subprocess, "run", run):
+            self.assertTrue(SL._write_rgb_video(path, frames))
+        self.assertEqual(len(fed["bytes"]), frames.numel())        # all 3072 bytes, not the first 1000
+        self.assertEqual(fed["bytes"], frames.numpy().tobytes())
+
     def test_status_cascades_through_continuity(self):
         d = tempfile.mkdtemp(dir=_TMP)
         for i in range(3):
