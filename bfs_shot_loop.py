@@ -2274,6 +2274,21 @@ def picture_cfg(cfg: dict, plan: dict, name: str) -> dict:
     return dict(cfg, describe_preset=own["preset"], describe_custom=own.get("custom") or cfg.get("describe_custom", ""))
 
 
+def kept_picture_details(plan: dict, names: list) -> dict:
+    """🤖 Auto prompt: the pictures of `names` whose saved description the user keeps (the picture's *use my
+    description* switch, plan['picture_cfg'][name]['keep']): name -> that text, used word for word instead of a fresh
+    description. A picture switched on without a description is described as usual. Only picture_details counts (the
+    panel, which sets the switch, keeps older plans' ref_details there) and only ASCII whitespace is trimmed: the same
+    as the panel's keptPictureDetails, which dates the written prompts with it."""
+    own, saved = plan.get("picture_cfg") or {}, plan.get("picture_details") or {}
+    out = {}
+    for n in names:
+        t = str(saved.get(n) or "").strip(" \t\n\r\f\v")
+        if n not in out and isinstance(own.get(n), dict) and own[n].get("keep") and t:
+            out[n] = t
+    return out
+
+
 def fill_picture_details(text: str, names: list, images: list, saved: dict, clip=None, cfg: dict | None = None,
                          tag: str = "", keep_missing: bool = False) -> str:
     """{details@Picture k} = the description of the shot's k-th picture: the one saved for that image (📝 Describe each
@@ -2471,19 +2486,34 @@ def shot_mode(seg: dict) -> str:
     return "mask" if seg.get("inpaint") else "paste" if seg.get("paste") else "frame"
 
 
-def auto_prompt_for(instruction: str, names: list, seg: dict, template: str = "", style: str = "h3", prompt_trigger: str = "motion_transfer") -> str:
-    """What a written prompt was made from (the panel computes the same string to show it is out of date)."""
+def auto_prompt_for(instruction: str, names: list, seg: dict, template: str = "", style: str = "h3",
+                    prompt_trigger: str = "motion_transfer", kept: dict | None = None) -> str:
+    """What a written prompt was made from (the panel computes the same string to show it is out of date). `kept`
+    (kept_picture_details) is added only when a picture keeps its description, so other prompts stay up to date."""
     marks = [[x["picture"], x["color"]] for x in seg.get("color_guide_marks") or []] if seg.get("color_guide") else []
-    return json.dumps([instruction or "", names, marks, shot_mode(seg), (seg.get("mask") or {}).get("text") or "",
-                       seg.get("target") or "", template or "", style or "h3", prompt_trigger, AUTO_PROMPT_REVISION], separators=(",", ":"), ensure_ascii=False)
+    out = [instruction or "", names, marks, shot_mode(seg), (seg.get("mask") or {}).get("text") or "",
+           seg.get("target") or "", template or "", style or "h3", prompt_trigger, AUTO_PROMPT_REVISION]
+    if kept:
+        out.append([[n, t] for n, t in kept.items()])   # names order, once each (the panel's keptPictureDetails)
+    return json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+
+
+def written_prompt_for(plan: dict, seg: dict, names: list, request: str, template: str = "") -> str:
+    """auto_prompt_for of one shot with the plan's Auto prompt settings and kept descriptions: what a prompt written
+    now is stamped with, and what a stored one must match to be used."""
+    ap = {**AUTO_PROMPT_DEFAULTS, **(plan.get("auto_prompt") or {})}
+    return auto_prompt_for(request, names, seg, template, ap.get("style") or "h3", ap["trigger"],
+                           kept_picture_details(plan, names))
 
 
 def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_texts: list, instruction: str,
                     seg: dict, source: str = "guide", duration: float = 0.0, max_tokens: int = 2048,
-                    cuts: list | None = None, template: str = "", style: str = "h3", source_facts: str | None = None, prompt_trigger: str = "motion_transfer") -> str:
+                    cuts: list | None = None, template: str = "", style: str = "h3", source_facts: str | None = None, prompt_trigger: str = "motion_transfer",
+                    keep_notes: list | None = None) -> str:
     """One shot's prompt in H3's full-reference format, written by the VLM from key frames of the shot ([1,H,W,3] each,
     at `times` seconds into it), the shot's reference pictures (<Picture 1> first) with their descriptions, the user's
-    request and the shot's Colored Marks, selection and mode."""
+    request and the shot's Colored Marks, selection and mode. keep_notes (the user's kept picture descriptions) are
+    added to the request once it is known whether the request is a whole template, so they never become template text."""
     nf, npics = len(frames), len(pictures)
     tt = ", ".join(_mmss(t) for t in times) if times else ""
     pics = ""
@@ -2528,6 +2558,8 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
     if not template and is_template(instruction):
         template, instruction = instruction, ""
     trigger = request_trigger(template) or request_trigger(instruction) or str(prompt_trigger or "").strip().rstrip(":")
+    if keep_notes:
+        instruction = " ".join([instruction.strip(), *keep_notes]).strip()
     if trigger and not re.fullmatch(r"[A-Za-z][\w-]*", trigger):
         raise ValueError("Invalid prompt trigger")
     if cuts:
@@ -2758,12 +2790,17 @@ def isolated_picture_descriptions(clip, pictures: list, max_tokens: int = 320, i
 def fresh_picture_details(clip, text: str, names: list, pictures: list, plan: dict, cfg: dict, tag: str = "") -> str:
     """🤖 Auto prompt: every {details} / {details@Picture k} in `text` is that picture described alone now, for this
     sentence and with the picture's describe settings (preset or custom instruction, fit the prompt), as a run
-    without Auto prompt does. Never a saved description: it can be stale or from a grouped reference batch."""
+    without Auto prompt does. A saved description is used only for a picture with *use my description* on
+    (kept_picture_details), word for word; otherwise it can be stale or from a grouped reference batch."""
     text = picture_markers(text)
+    kept = kept_picture_details(plan, names)
     fresh = {}
     for m in PICTURE_DETAILS.finditer(text):
         k = int(m.group(1)) - 1
-        if 0 <= k < len(names) and k < len(pictures) and pictures[k] is not None and names[k] not in fresh:
+        if 0 <= k < len(names) and names[k] in kept and names[k] not in fresh:
+            fresh[names[k]] = kept[names[k]]   # as without Auto prompt (fill_picture_details' clean_slot only)
+            print(f"{tag}: {m.group(0)} = {fresh[names[k]]!r} (your description, kept)", flush=True)
+        elif 0 <= k < len(names) and k < len(pictures) and pictures[k] is not None and names[k] not in fresh:
             pcfg = picture_cfg(cfg, plan, names[k])
             fresh[names[k]] = describe_picture(clip, pictures[k], text, m.group(0), pcfg)
             if fresh[names[k]]:
@@ -2790,12 +2827,22 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
     sc = side / max(analysis["width"], analysis["height"])
     size = (max(32, int(analysis["width"] * sc) // 2 * 2), max(32, int(analysis["height"] * sc) // 2 * 2))
     frames = [torch.from_numpy(f.astype(np.float32) / 255.0)[None] for f in _read_frames(path, src[picks], size)]
-    # Saved details can be stale or have been produced from a grouped reference batch: neither is read here.
-    # The writer gets the isolated evidence of every picture; a {details} in the template or the request gets that
-    # picture described alone for its sentence with the user's describe settings (fresh_picture_details).
+    # Saved details can be stale or have been produced from a grouped reference batch: they are read only for a
+    # picture with *use my description* on. The writer gets the isolated evidence of every picture; a {details} in the
+    # template or the request gets that picture described alone for its sentence with the user's describe settings,
+    # or its kept description (fresh_picture_details), and a kept description is also part of the request (the
+    # evidence is framed as facts, not instructions, so it is not put there).
+    kept = kept_picture_details(plan, names)
     picture_evidence = isolated_picture_descriptions(clip, pictures, 320, side)
     tag = f"[BFS Auto prompt] shot {seg['start']}-{seg['end']}"
     request = fresh_picture_details(clip, instruction, names, pictures, plan, vcfg, tag)
+    keep_lines = []
+    for k, name in enumerate(names):
+        said = " ".join(kept.get(name, "").split()).rstrip(" .")
+        if said and names.index(name) == k:   # the first slot of that picture, as the {details} fill
+            end = "" if said[-1] in "!?" else "."
+            keep_lines.append(f"<Picture {k + 1}> is described by the user as: {said}{end} Keep all of these details "
+                              f"for <Picture {k + 1}>; they override any other description of it.")
     tmpl = fresh_picture_details(clip, template, names, pictures, plan, vcfg, tag)
     source_question = ("These images are ONLY chronological frames of the SOURCE video, not replacement "
                        "references. Describe the visible actors separately, their apparent gender when clear, "
@@ -2808,8 +2855,9 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
     text = write_h3_prompt(clip, frames, [(int(x) - seg["start"]) / fps for x in picks], pictures,
                            picture_evidence, request, seg, ap.get("source") or "guide", L / fps,
                            int(vcfg.get("max_tokens") or 1024), [(c - seg["start"]) / fps for c in cuts], tmpl,
-                           ap.get("style") or "h3", source_facts=source_facts, prompt_trigger=ap["trigger"])
-    return {"text": text, "for": auto_prompt_for(instruction, names, seg, template, ap.get("style") or "h3", ap["trigger"])}
+                           ap.get("style") or "h3", source_facts=source_facts, prompt_trigger=ap["trigger"],
+                           keep_notes=keep_lines)
+    return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template)}
 
 
 PLACE_Q = ("This picture shows a place; the patch of black-and-white noise only hides a person, ignore it. Describe the "
@@ -3397,11 +3445,18 @@ def shot_signature(plan: dict, seg: dict, head: int, extra: dict) -> str:
     if len(plan.get("global_refs") or []) > 2:
         doc["g"]["global_refs_more"] = plan["global_refs"][2:]
     for k in ("picture_details", "picture_cfg"):
-        if plan.get(k):
-            doc["g"][k] = plan[k]
+        v = plan.get(k)
+        if k == "picture_cfg" and v:   # 'use my description' (keep) counts below, only for the shots it changes
+            v = {n: {a: b for a, b in c.items() if a != "keep"} if isinstance(c, dict) else c for n, c in v.items()
+                 if not (isinstance(c, dict) and c and set(c) == {"keep"})}
+        if v:
+            doc["g"][k] = v
     if (plan.get("auto_prompt") or {}).get("enabled"):   # the shot's written prompt is its prompt
         doc["g"]["auto_prompt"] = plan["auto_prompt"]
         doc["s"]["written"] = ((plan.get("auto_prompts") or {}).get(f"{seg.get('start')}-{seg.get('end')}") or {}).get("text", "")
+        kept = kept_picture_details(plan, shot_ref_names(seg.get("refs") or [], plan.get("global_refs") or []))
+        if kept:   # its written prompt is written again with them (auto_prompt_for)
+            doc["s"]["kept"] = kept
     return hashlib.sha1(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -3817,9 +3872,9 @@ class BFSShotPlanner:
             for i in work:
                 key, request = f"{segs[i]['start']}-{segs[i]['end']}", segs[i]["prompt"] or p.get("global_prompt", "")
                 got = stored.get(key) or {}
-                if got.get("text") and got.get("for") != auto_prompt_for(request, names_of(segs[i]), segs[i], template, ap["style"], ap["trigger"]):
+                if got.get("text") and got.get("for") != written_prompt_for(p, segs[i], names_of(segs[i]), request, template):
                     if vlm is None:
-                        raise ValueError(f"Shot {i + 1}: written prompt is outdated after changes to request/pictures/marks or writer rules. Use Write again in the panel, or connect the Planner VLM to regenerate it. The old prompt was not sent to generation.")
+                        raise ValueError(f"Shot {i + 1}: written prompt is outdated after changes to request/pictures/marks, a kept ('use my description') picture description or writer rules. Use Write again in the panel, or connect the Planner VLM to regenerate it. The old prompt was not sent to generation.")
                     print(f"[BFS Shot Planner] shot {i + 1}: regenerating outdated written prompt", flush=True)
                     got = {}
                 if got.get("text"):

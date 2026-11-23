@@ -27,6 +27,17 @@ import { promptsTab } from "./shotloop/view_prompts.js";
 import { runTab } from "./shotloop/view_run.js";
 import { busyBar, pointsModal, tourModal } from "./shotloop/view_modal.js";
 
+// 🤖 Auto prompt: the pictures of `names` with "use my description" on and a description, as [[name, text], ...] in
+// names order (bfs_shot_loop.kept_picture_details; only ASCII whitespace is trimmed, the same on both sides)
+function keptPictureDetails(plan, names) {
+  const out = new Map(), own = (o, n) => (o && Object.hasOwn(o, n) ? o[n] : undefined);
+  for (const n of names) {
+    const t = String(own(plan.picture_details, n) || "").replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
+    if (!out.has(n) && own(plan.picture_cfg, n)?.keep && t) out.set(n, t);
+  }
+  return [...out];
+}
+
 const viewUrl = name => {
   if (!name) return "";
   const i = name.lastIndexOf("/");
@@ -544,8 +555,10 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     segs.value.forEach((x, i) => x.names.forEach((name, k) => { if (x.refs[k] === name) add(name, `#${i + 1}: ${k + 1}`); }));
     return [...out.entries()].map(([name, where]) => ({ name, where }));
   });
-  // names: the pictures to describe (all of them by default)
-  async function describePictures(names = pictures.value.map(x => x.name)) {
+  // names: the pictures to describe (by default all of them, except the ones that keep their own description)
+  const describable = computed(() => pictures.value.map(x => x.name).filter(n => !plan.picture_cfg?.[n]?.keep));
+  async function describePictures(names = describable.value) {
+    if (!names.length) return;
     busy.value = "Describing the pictures with the VLM…"; error.value = "";
     try {
       const j = await job("/bfs/shotloop/describe", { method: "POST",
@@ -561,8 +574,10 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   const autoFor = s => {
     const marks = s.color_guide ? [[s.color_guide_picture, pictureColor(plan, s.color_guide_picture)],
       ...s.regions.filter(r => String(r.text || "").trim() || (r.points || []).length).map(r => [r.picture, pictureColor(plan, r.picture)])] : [];
+    const kept = keptPictureDetails(plan, s.names);
     return JSON.stringify([s.prompt || plan.global_prompt || "", s.names, marks, modeOf(s), s.mask?.text || "", s.target || "",
-      plan.auto_prompt?.template || "", plan.auto_prompt?.style || "h3", plan.auto_prompt?.trigger ?? "motion_transfer", "fitted-picture-details-v8"]);
+      plan.auto_prompt?.template || "", plan.auto_prompt?.style || "h3", plan.auto_prompt?.trigger ?? "motion_transfer", "fitted-picture-details-v8",
+      ...(kept.length ? [kept] : [])]);
   };
   const writtenOf = s => plan.auto_prompts?.[segKey(s)] || null;
   const setAuto = (k, v) => { plan.auto_prompt = { ...plan.auto_prompt, [k]: v }; save(); };
@@ -916,7 +931,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     refreshFiles, analyze, autoSplit, analyzeContent, findPeople, setCast, describeTarget, previewMask, setMask, setMaskCfg,
     openPoints, switchPointRegion, savePoints, savePointsAll, saveTrack, clearTrack, pointsTo, clearMask, copyFrom, analyseVLM, setVlmCfg,
     applySug, applyAllSug, setCastOpt, setGlobalMaskVideo, setFilter, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
-    frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describePictures, setPictureDetail, setPictureCfg,
+    frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describable, keptPictureDetails, describePictures, setPictureDetail, setPictureCfg,
     setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
     autoFor, writtenOf, setAuto, setWritten, writePrompts,
   };

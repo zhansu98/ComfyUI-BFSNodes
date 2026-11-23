@@ -1902,6 +1902,167 @@ class AutoPromptDetailsTest(unittest.TestCase):
             SL.fresh_picture_details(object(), self.TEMPLATE, self.names, self.pictures, plan, SL.vlm_cfg({}))
         self.assertIn("outfit only", self.instructions[0])
 
+    def test_a_kept_description_is_used_word_for_word(self):
+        mine = "woman with curly red hair, freckles and a black leather jacket. She is 30 and wears small shown in-ear studs"
+        plan = {"picture_details": {"a.png": f"The {mine}"}, "picture_cfg": {"a.png": {"keep": True}}}
+        with patch.object(SL, "vlm_describe", side_effect=AssertionError("a kept picture is not described")):
+            out = SL.fresh_picture_details(object(), self.TEMPLATE, self.names, self.pictures, plan, SL.vlm_cfg({}))
+            request = SL.fresh_picture_details(object(), "Swap in {details}.", self.names, self.pictures, plan,
+                                               SL.vlm_cfg({}))
+        # not cut, shortened or fitted: only a leading article is dropped, as for any saved description (clean_slot)
+        self.assertIn(f"<Subject 1> is the {mine} shown in <Picture 1>", out)
+        self.assertEqual(request, f"Swap in {mine}.")
+
+    def test_keep_without_a_description_or_off_describes_as_usual(self):
+        for plan in ({"picture_cfg": {"a.png": {"keep": True}}, "picture_details": {"a.png": "  "}},
+                     {"picture_cfg": {"a.png": {"keep": False}}, "picture_details": {"a.png": "STALE saved text"}}):
+            self.instructions.clear()
+            with patch.object(SL, "vlm_describe", side_effect=self._describe("man with a mustache")):
+                out = SL.fresh_picture_details(object(), self.TEMPLATE, self.names, self.pictures, plan, SL.vlm_cfg({}))
+            self.assertIn("man with a mustache", out)
+            self.assertNotIn("STALE", out)
+            self.assertEqual(len(self.instructions), 1)
+
+    def test_kept_description_reaches_the_writer_and_dates_its_prompt(self):
+        import numpy as np
+        analysis = {"fps": 24.0, "fps_src": 24.0, "n_src": 48, "n": 48, "width": 8, "height": 8}
+        seg = {"start": 0, "end": 24, "prompt": ""}
+        mine = "woman with curly red hair and a scar over her left eye"
+        plan = {"auto_prompt": {"enabled": True}, "picture_details": {"a.png": mine},
+                "picture_cfg": {"a.png": {"keep": True}}}
+        captured = []
+        with patch.object(SL, "find_cuts", return_value=([], "none")), \
+                patch.object(SL, "_read_frames", side_effect=lambda path, idx, size, stage=None:
+                             [np.zeros((8, 8, 3), np.uint8) for _ in idx]), \
+                patch.object(SL, "_status"), \
+                patch.object(SL, "vlm_generate", return_value="A man gives two thumbs up."), \
+                patch.object(SL, "vlm_describe", side_effect=self._describe(self.LIST)), \
+                patch.object(SL, "write_h3_prompt", side_effect=lambda *a, **k: captured.append((a, k)) or "body_swap: ok"):
+            out = SL.auto_prompt_shot(object(), plan, analysis, "x.mp4", seg, self.names, self.pictures, {},
+                                      "Replace the person.", SL.vlm_cfg({}), self.TEMPLATE)
+        args = captured[0][0]
+        self.assertIn(f"<Subject 1> is the {mine} shown in <Picture 1>", args[11])
+        self.assertEqual(args[4], [self.EVIDENCE])   # evidence stays facts only
+        # the request (instructions, not the "facts" block) tells the writer to keep the user's details
+        self.assertEqual(args[5], "Replace the person.")
+        self.assertEqual(captured[0][1]["keep_notes"], [f"<Picture 1> is described by the user as: {mine}. Keep all of "
+                                                        "these details for <Picture 1>; they override any other "
+                                                        "description of it."])
+        # the stamp the run checks a stored prompt against (written_prompt_for): editing the kept text dates it
+        self.assertEqual(out["for"], SL.written_prompt_for(plan, seg, self.names, "Replace the person.", self.TEMPLATE))
+        edited = {**plan, "picture_details": {"a.png": mine + ", green eyes"}}
+        self.assertNotEqual(out["for"], SL.written_prompt_for(edited, seg, self.names, "Replace the person.", self.TEMPLATE))
+        # no kept picture: the same string as before the option, so older written prompts stay up to date
+        self.assertEqual(SL.auto_prompt_for("x", self.names, seg, kept={}), SL.auto_prompt_for("x", self.names, seg))
+        off = {**plan, "picture_cfg": {"a.png": {"keep": False}}}
+        self.assertEqual(SL.written_prompt_for(off, seg, self.names, "x"), SL.auto_prompt_for("x", self.names, seg))
+
+    def test_keep_lines_name_the_pictures_slot(self):
+        import numpy as np
+        analysis = {"fps": 24.0, "fps_src": 24.0, "n_src": 48, "n": 48, "width": 8, "height": 8}
+        seg = {"start": 0, "end": 24, "prompt": ""}
+        names, pictures = ["x.png", "a.png", "a.png", "b.png"], [torch.zeros(1, 4, 4, 3)] * 4
+        plan = {"picture_details": {"a.png": "red scarf,\n  scar over the left eye.", "b.png": "\u00a0"},
+                "picture_cfg": {"a.png": {"keep": True}, "b.png": {"keep": True}}}
+        captured = []
+        with patch.object(SL, "find_cuts", return_value=([], "none")), \
+                patch.object(SL, "_read_frames", side_effect=lambda path, idx, size, stage=None:
+                             [np.zeros((8, 8, 3), np.uint8) for _ in idx]), \
+                patch.object(SL, "_status"), patch.object(SL, "vlm_generate", return_value="facts"), \
+                patch.object(SL, "vlm_describe", return_value="evidence"), \
+                patch.object(SL, "write_h3_prompt", side_effect=lambda *a, **k: captured.append(k) or "ok"):
+            SL.auto_prompt_shot(object(), plan, analysis, "x.mp4", seg, names, pictures, {}, "Swap.", SL.vlm_cfg({}))
+        # slot 2 (its first), once, one line, no doubled period; an NBSP-only text gives no empty override
+        self.assertEqual(captured[0]["keep_notes"], [
+            "<Picture 2> is described by the user as: red scarf, scar over the left eye. Keep all of these details for "
+            "<Picture 2>; they override any other description of it."])
+
+    def test_keep_notes_never_become_template_text(self):
+        seen = []
+        whole = ("body_swap: subject_definitions: <Subject 1> is shown in <Picture 1>.\nsummary: Replace the subject.\n"
+                 "detailed_description: [Shot 1] x")
+        note = "<Picture 1> is described by the user as: Summary: tall. Keep all of these details for <Picture 1>."
+        for request in (whole, "Replace both people."):   # a whole-prompt request, and notes that look like sections
+            seen.clear()
+            with patch.object(SL, "vlm_generate", side_effect=lambda clip, prompt, *a, **k: seen.append(prompt)
+                              or "subject_definitions: <Subject 1> x. detailed_description: [Shot 1] y"):
+                SL.write_h3_prompt(None, [torch.zeros(1, 8, 8, 3)], [0.0], [torch.zeros(1, 4, 4, 3)], [""], request,
+                                   {}, "guide", keep_notes=[note, note.replace("Summary", "subject_definitions")])
+            ask = seen[0]
+            if request == whole:
+                self.assertIn("The user's request: " + note, ask)     # the notes are the request
+                template = ask.split("The prompt template:\n", 1)[1].split("\n\n", 1)[0]
+                self.assertEqual(template, whole)                       # and the template is untouched
+            else:
+                self.assertIn("The user's request: Replace both people. " + note, ask)
+                self.assertNotIn("The prompt template:", ask)           # still a request, not a template
+        # the composition prompt Auto prompt really uses (with source facts)
+        seen.clear()
+        with patch.object(SL, "vlm_generate", side_effect=lambda clip, prompt, *a, **k: seen.append(prompt)
+                          or "subject_definitions: <Subject 1> x. detailed_description: [Shot 1] y"):
+            SL.write_h3_prompt(None, [torch.zeros(1, 8, 8, 3)], [0.0], [torch.zeros(1, 4, 4, 3)], [""], whole,
+                               {}, "guide", source_facts="facts", keep_notes=[note])
+        composed = next(p for p in seen if "USER REQUEST:" in p)
+        self.assertIn("USER REQUEST:\n" + note + "\n", composed)
+        self.assertNotIn("described by the user", composed.split("TEMPLATE:", 1)[1])
+
+    def test_only_the_panels_picture_details_are_kept(self):
+        # a pre-1.113 ref_details text the user cleared in the panel is not kept (the panel shows it as empty)
+        for cleared in ({"a.png": ""}, {}, {"a.png": " \n"}):   # what the cleared textarea saves, or no key
+            plan = {"ref_details": {"a.png": "OLD legacy text"}, "picture_details": cleared,
+                    "picture_cfg": {"a.png": {"keep": True}, "b.png": {"keep": True}}}
+            self.assertEqual(SL.kept_picture_details(plan, ["a.png", "b.png"]), {})
+        plan["picture_details"] = {"a.png": "\ufeffred scarf \u00a0", "b.png": "x"}
+        self.assertEqual(list(SL.kept_picture_details(plan, ["b.png", "a.png", "b.png"]).items()),
+                         [("b.png", "x"), ("a.png", "\ufeffred scarf \u00a0")])   # names order, once; ASCII trim only
+        stamp = SL.written_prompt_for(plan, {}, ["b.png", "a.png", "b.png"], "req")
+        self.assertTrue(stamp.endswith('[["b.png","x"],["a.png","\ufeffred scarf \u00a0"]]]'), stamp)
+
+    def test_the_switch_rerenders_only_the_shots_it_changes(self):
+        seg = {"start": 0, "end": 24, "refs": ["b.png"], "prompt": ""}
+        uses_a = {"start": 24, "end": 48, "refs": ["a.png"], "prompt": ""}
+        for auto in (False, True):
+            base = {"global_refs": [], "auto_prompt": {"enabled": auto},
+                    "picture_details": {"a.png": "red scarf"}, "picture_cfg": {"b.png": {"preset": "outfit"}}}
+            ticked = {**base, "picture_cfg": {**base["picture_cfg"], "a.png": {"keep": True}}}
+            unticked = {**base, "picture_cfg": {**base["picture_cfg"], "a.png": {"keep": False}}}
+            sig = lambda plan, s: SL.shot_signature(plan, s, 0, {})
+            self.assertEqual(sig(base, seg), sig(ticked, seg))       # a shot without that picture
+            self.assertEqual(sig(base, uses_a), sig(unticked, uses_a))   # tick, then untick
+            self.assertEqual(sig(base, uses_a) != sig(ticked, uses_a), auto)   # changes it only with Auto prompt
+        self.assertNotEqual(sig(base, seg), sig({**base, "picture_cfg": {"b.png": {"preset": "full"}}}, seg))
+
+    def test_browser_dates_kept_prompts_like_the_backend(self):
+        import json
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        src = (ROOT / "web/js/bfs_shot_loop.js").read_text(encoding="utf-8")
+        helper = src[src.index("function keptPictureDetails"):src.index("const viewUrl")]
+        auto_for = src[src.index("const autoFor ="):src.index("const writtenOf")]
+        plans = [
+            {"picture_details": {"a.png": "  Rotes Tuch, 赤いスカーフ 🧣 \"q\" \\ \u2028 end\n"}, "picture_cfg": {"a.png": {"keep": True}}},
+            {"picture_details": {"a.png": "x", "b.png": "tall"}, "picture_cfg": {"b.png": {"keep": True}, "a.png": {"keep": False}}},
+            {"picture_details": {"a.png": "\ufeffzero width\u00a0"}, "picture_cfg": {"a.png": {"keep": True}}},
+            {"picture_details": {}, "picture_cfg": {"a.png": {"keep": True}}},
+            {"picture_details": {}, "picture_cfg": {"constructor": {"keep": True}}},   # no prototype lookups
+            {"picture_details": {"a.png": "first", "b.png": "second"},                 # two kept: names order, once
+             "picture_cfg": {"a.png": {"keep": True}, "b.png": {"keep": True}}},
+        ]
+        names = [["a.png", "b.png", "a.png"], ["a.png", "b.png"], ["a.png"], ["a.png"], ["constructor"],
+                 ["b.png", "a.png", "b.png"]]
+        script = ("let plan;\n" + helper + auto_for + "\nconst modeOf = () => 'frame', pictureColor = () => '';\n"
+                  "const cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+                  "console.log(JSON.stringify(cases.map(([p, names]) => { plan = { ...p, auto_prompt: {}, global_prompt: 'req' };"
+                  " return autoFor({ names, regions: [], prompt: '' }); })));")
+        run = subprocess.run([node, "-e", script], input=json.dumps(list(zip(plans, names))), capture_output=True,
+                             text=True, encoding="utf-8")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        want = [SL.written_prompt_for(p, {}, n, "req") for p, n in zip(plans, names)]
+        self.assertEqual(json.loads(run.stdout), want)
+
     def test_request_details_are_filled_the_same_way(self):
         with patch.object(SL, "vlm_describe", side_effect=self._describe("man with a mustache")):
             out = SL.fresh_picture_details(object(), "Swap the person for the {details} from <Picture 1>.",

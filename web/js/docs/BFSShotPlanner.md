@@ -443,7 +443,8 @@ trigger word first; the writer applies the request, adds the pictures' visible f
 shot's camera, place, light and actions. A `{details}` / `{details@Picture n}` in the template or the request is
 filled before the writer starts: that picture described by itself for that sentence, with the 📝 Describe settings
 (preset or custom instruction; *Fit the prompt* for the short and object presets), exactly as a run without Auto
-prompt does; the writer also gets its own description of every picture as evidence. Prompts written before 1.118.1
+prompt does; the writer also gets its own description of every picture as evidence. To make Auto prompt use **your**
+words for a picture instead, tick **use my description** on it (see *One description per picture*). Prompts written before 1.118.1
 are outdated: the next run writes them again with the planner's VLM (see below).
 The panel's 🤖 Write uses the template of the last run (shown in the card).
 A request that is itself a whole prompt (H3 sections) is used as the template the same way. **Style** picks how a prompt without template is written: *H3
@@ -466,13 +467,29 @@ Without a VLM and without a written prompt, the template (else the request) is u
 
 ### One description per picture (1.113.0)
 
-Descriptions are per picture: **📝 Describe refs** describes every picture the plan uses by itself, once per image.
+Descriptions are per picture: **📝 Describe refs** describes every picture the plan uses by itself, once per image
+(except the ones with *use my description* on).
 `{details}` is picture 1's description, `{details2}` picture 2's and **`{details@Picture n}`** (or
 `{details@Picture3}`) picture n's, so each shot gets the descriptions of *its* pictures. The dropdown next to the button
 sets what is described for every picture; a picture can have its own (e.g. *full body* for a character sheet, *head /
 face* for a close-up, *outfit*, or *custom* with its own instruction), and **🔄** describes only that picture again. A
 picture without a description is described at run time by the planner's VLM, else by the conditioning node's VLM, else
 it becomes "character". Descriptions saved by older plans (per reference set) are read as those pictures'.
+
+**Use my description (1.122.0):** without Auto prompt, a picture's saved (or typed) description is always what fills its
+`{details}`. With 🤖 Auto prompt on, a `{details}` is normally described again from the picture for each prompt, and
+the saved text is ignored. Tick **use my description** on a picture to keep your text instead. Auto prompt then puts it
+into that picture's `{details}` as written: it is not shortened, fitted or described again. Only the prompt words a
+description sometimes repeats around the marker are trimmed, as for any saved description (a leading "the / a / an"
+or "<Subject n> is the", a trailing "is" or "shown in <Picture n>"). Your text is also added to the request the
+prompt writer follows, with the instruction to keep all its details and that it wins over any other description of the
+picture (including the writer's own look at it), also when the template has no `{details}`. The writer is a VLM, so check the written prompt in the Shots tab; only the `{details}`
+fill is guaranteed word for word. **📝 Describe refs** and 🎲 skip the picture and its 🔄 is off, so the text is not
+overwritten. Ticking the switch or editing the text marks the written prompts of the shots using that picture *older*,
+so they are written again. Ticking (or unticking) renders again only the stored shots using that picture, and with Auto
+prompt off the switch changes nothing; editing any picture's description renders every stored shot again, as it always
+has. Tip: click **🤖 Write all prompts** before the run, so each changed shot renders once with its new prompt.
+Ticking it with an empty description has no effect until you write one.
 
 **Fit the prompt** (on by default, next to 📝 Describe refs): the VLM gets the sentence of the prompt that holds the
 marker, with a blank in its place (e.g. `<Subject 1> is the ___ shown in <Picture 1>`), and writes the description for
