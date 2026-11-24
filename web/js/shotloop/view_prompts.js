@@ -117,7 +117,8 @@ function autoSection(c) {
   const { plan, busy, segs } = c;
   const A = plan.auto_prompt || {};
   const S = segs.value, missing = S.filter(s => !c.writtenOf(s)?.text).length;
-  const stale = S.filter(s => c.writtenOf(s)?.text && c.writtenOf(s).for !== c.autoFor(s)).length;
+  const locked = S.filter(s => c.lockedOf(s)).length;
+  const stale = S.filter(s => !c.lockedOf(s) && c.writtenOf(s)?.text && c.writtenOf(s).for !== c.autoFor(s)).length;
   return section("🤖 Auto prompt (H3)", [
     h("div", { class: "row", style: "gap:12px;align-items:center" }, [
       check(A.enabled, v => c.setAuto("enabled", v), "Write the prompts with the VLM",
@@ -130,13 +131,14 @@ function autoSection(c) {
         v => c.setAuto("frames", parseInt(v) || 0), { style: "width:auto" }), "auto: about 1.5 per second, 3 to 8"),
       fld("Source video in the prompt", select(A.source || "guide", [["guide", "guide video (aligned guide)"], ["video", "<Video 1> (native reference video)"]],
         v => c.setAuto("source", v), { style: "width:auto" }), "match the conditioning node's guide_mode"),
-      h("button", { class: "pri", disabled: !!busy.value || !S.length, onClick: () => c.writePrompts() }, "🤖 Write all prompts"),
+      h("button", { class: "pri", disabled: !!busy.value || !S.length || locked === S.length,
+        title: locked ? "shots with 'use my prompt' on keep theirs" : "", onClick: () => c.writePrompts() }, "🤖 Write all prompts"),
       h("button", { disabled: !!busy.value || !missing, onClick: () => c.writePrompts(S.map((s, i) => (c.writtenOf(s)?.text ? -1 : i)).filter(i => i >= 0)) },
         `only the missing (${missing})`),
     ]),
     A.enabled && A.template ? h("div", { class: "hint", style: "display:block;margin-top:4px", title: A.template },
       `Template (the node's prompt input, last run): ${A.template.slice(0, 110)}${A.template.length > 110 ? "…" : ""} · the prompt boxes are the request applied to it`) : null,
-    hint(A.enabled ? `${S.length - missing}/${S.length} shots have a written prompt${stale ? ` · ${stale} older than their request, pictures or marks` : ""} · shots without one are written when the workflow runs (with the VLM on the planner) · edit them in each shot (Shots tab)`
+    hint(A.enabled ? `${S.length - missing}/${S.length} shots have a written prompt${stale ? ` · ${stale} older than their request, pictures or marks` : ""}${locked ? ` · ${locked} 🔒 yours ('use my prompt', never rewritten)` : ""} · shots without one are written when the workflow runs (with the VLM on the planner) · edit them in each shot (Shots tab)`
       : "Off: the prompt boxes are the prompts.", "display:block;margin-top:4px"),
   ], { sub: "request + video + pictures -> MiniMax H3 prompt", right: A.enabled ? pill("on", "ok") : pill("off") });
 }

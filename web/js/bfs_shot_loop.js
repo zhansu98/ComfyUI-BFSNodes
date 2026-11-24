@@ -38,6 +38,14 @@ function keptPictureDetails(plan, names) {
   return [...out];
 }
 
+// 🤖 Auto prompt: the shot's written prompt when "use my prompt" locks it, else "" (bfs_shot_loop.locked_prompt: a
+// lock without text, only ASCII whitespace, is no lock)
+function lockedPrompt(plan, key) {
+  const got = plan.auto_prompts && Object.hasOwn(plan.auto_prompts, key) ? plan.auto_prompts[key] : null;
+  if (!got || typeof got !== "object" || got.lock !== true || typeof got.text !== "string") return "";
+  return got.text.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "") ? got.text : "";
+}
+
 const viewUrl = name => {
   if (!name) return "";
   const i = name.lastIndexOf("/");
@@ -580,17 +588,31 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       ...(kept.length ? [kept] : [])]);
   };
   const writtenOf = s => plan.auto_prompts?.[segKey(s)] || null;
+  // 🔒 use my prompt: the shot's written prompt is sent as written, never dated or rewritten
+  const lockedOf = s => lockedPrompt(plan, segKey(s));
   const setAuto = (k, v) => { plan.auto_prompt = { ...plan.auto_prompt, [k]: v }; save(); };
   const setWritten = (s, text) => {
     const k = segKey(s), cur = plan.auto_prompts[k] || {};
     plan.auto_prompts = { ...plan.auto_prompts, [k]: { ...cur, text, for: cur.for ?? autoFor(s) } }; save();
   };
-  // the VLM writes the prompts of these shots (all by default)
+  const setLock = (s, on) => {
+    const k = segKey(s), { lock, ...cur } = plan.auto_prompts[k] || {};
+    plan.auto_prompts = { ...plan.auto_prompts, [k]: on ? { text: "", ...cur, lock: true } : cur }; save();
+  };
+  // prompts the VLM wrote: a shot locked meanwhile keeps its own
+  const mergeWritten = prompts => {
+    const out = { ...plan.auto_prompts };
+    for (const [k, v] of Object.entries(prompts || {})) if (!lockedPrompt(plan, k)) out[k] = v;
+    plan.auto_prompts = out;
+  };
+  // the VLM writes the prompts of these shots (all by default), never a locked one
   async function writePrompts(indices = segs.value.map((_, i) => i)) {
+    indices = indices.filter(i => segs.value[i] && !lockedOf(segs.value[i]));
+    if (!indices.length) return;   // (the server reads an empty list as every shot)
     busy.value = `Writing ${indices.length} prompt(s) with the VLM…`; error.value = "";
     try {
       const j = await job("/bfs/shotloop/autoprompt", { method: "POST", body: JSON.stringify({ plan: { ...plan }, indices, vlm_source: await io.vlmSource?.() }) });
-      plan.auto_prompts = { ...plan.auto_prompts, ...j.prompts }; save();
+      mergeWritten(j.prompts); save();
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
   }
@@ -829,7 +851,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     const d = e.detail; if (d?.video !== plan.video) return;
     const tpl = typeof d.template === "string" && d.template !== (plan.auto_prompt.template || "");
     if (tpl) plan.auto_prompt = { ...plan.auto_prompt, template: d.template };   // the prompt input of the last run
-    if (tpl || Object.keys(d.prompts || {}).length) { plan.auto_prompts = { ...plan.auto_prompts, ...(d.prompts || {}) }; save(); }
+    if (tpl || Object.keys(d.prompts || {}).length) { mergeWritten(d.prompts); save(); }
   };
   const onNext = e => { onProg(e); if (plan.run === "queue" && plan.auto_continue) setTimeout(() => app.queuePrompt(0, 1), 300); };
   onMounted(() => {
@@ -933,7 +955,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     applySug, applyAllSug, setCastOpt, setGlobalMaskVideo, setFilter, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
     frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describable, keptPictureDetails, describePictures, setPictureDetail, setPictureCfg,
     setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
-    autoFor, writtenOf, setAuto, setWritten, writePrompts,
+    autoFor, writtenOf, lockedOf, setAuto, setWritten, setLock, writePrompts,
   };
 
   return () => {

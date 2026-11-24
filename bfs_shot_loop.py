@@ -2812,6 +2812,75 @@ def fresh_picture_details(clip, text: str, names: list, pictures: list, plan: di
     return fill_picture_details(text, names, pictures, fresh, keep_missing=True)
 
 
+def locked_prompt(plan: dict, seg: dict) -> str:
+    """🤖 Auto prompt: the shot's written prompt when the user locked it (the shot's *use my prompt* switch,
+    plan['auto_prompts']['start-end']['lock']), else "". A locked prompt is sent as written (its placeholders are still
+    filled) and never rewritten or replaced (only the stored shot's signature looks at its age, locked_older); a lock
+    without text (only ASCII whitespace) is no lock, the shot
+    is written as usual. The same test as the panel's lockedPrompt."""
+    got = (plan.get("auto_prompts") or {}).get(f"{seg.get('start')}-{seg.get('end')}")
+    if not isinstance(got, dict) or got.get("lock") is not True or not isinstance(got.get("text"), str):
+        return ""
+    return got["text"] if got["text"].strip(" \t\n\r\f\v") else ""
+
+
+def stored_written_prompt(plan: dict, seg: dict, names: list, request: str, template: str = "") -> tuple:
+    """The state of a shot's stored written prompt (run_written_prompt says what the run does with it): ("locked",
+    text) the user's, ("current", text) still up to date, ("outdated", text) older than its request / pictures /
+    marks / writer rules, or ("missing", "")."""
+    mine = locked_prompt(plan, seg)
+    if mine:
+        return "locked", mine
+    got = (plan.get("auto_prompts") or {}).get(f"{seg.get('start')}-{seg.get('end')}")
+    got = got if isinstance(got, dict) else {}
+    if not got.get("text"):
+        return "missing", ""
+    if got.get("for") != written_prompt_for(plan, seg, names, request, template):
+        return "outdated", got["text"]
+    return "current", got["text"]
+
+
+def locked_older(plan: dict, seg: dict, names: list, request: str, template: str = "") -> bool:
+    """For the stored shot's signature: a locked prompt that is older than its request / pictures / marks / template /
+    style / kept descriptions. Without the lock the run would write it again (and did, in a run queued before the
+    switch), so the stored shot was not made from it. The writer's own revision does not count."""
+    # the writer's own revision (AUTO_PROMPT_REVISION) does not count: a BFS update does not re-render locked shots
+    def core(stamp):
+        try:
+            v = json.loads(stamp)
+        except (TypeError, ValueError, RecursionError):
+            return stamp
+        if isinstance(v, list) and len(v) > 9:
+            v[9] = None
+        return v
+    got = (plan.get("auto_prompts") or {}).get(f"{seg.get('start')}-{seg.get('end')}")
+    return bool(locked_prompt(plan, seg)) and core(got.get("for")) != core(written_prompt_for(plan, seg, names, request,
+                                                                                               template))
+
+
+def run_written_prompt(plan: dict, seg: dict, names: list, request: str, template: str, has_vlm: bool,
+                       shot: int) -> tuple:
+    """What a run with 🤖 Auto prompt on sends for one shot: ("locked", text) the user's prompt ('use my prompt') and
+    ("stored", text) an up-to-date written prompt, both as written; ("write", "") / ("rewrite", "") for the VLM to
+    write now (no prompt yet / an outdated one); ("fallback", template or request) without a VLM and without a prompt.
+    An outdated prompt without a VLM stops the run (ValueError): it is never sent to generation."""
+    state, text = stored_written_prompt(plan, seg, names, request, template)
+    if state == "locked":
+        return "locked", text
+    if state == "current":
+        return "stored", text
+    if state == "outdated" and not has_vlm:
+        raise ValueError(f"Shot {shot}: written prompt is outdated after changes to request/pictures/marks, a kept ('use my description') picture description or writer rules. Use Write again in the panel, tick 'use my prompt' on the shot to keep it as written, or connect the Planner VLM to regenerate it. The old prompt was not sent to generation.")
+    if has_vlm:
+        return ("rewrite" if state == "outdated" else "write"), ""
+    return "fallback", template or request
+
+
+def writable_shots(plan: dict, segs: list, indices=None) -> list:
+    """The shots the panel's 🤖 Write may (re)write: `indices` (all when empty) without the locked ones."""
+    return [int(i) for i in (indices or range(len(segs))) if not locked_prompt(plan, segs[int(i)])]
+
+
 def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, names: list, pictures: list,
                      pic_details: dict, instruction: str, vcfg: dict, template: str = "") -> dict:
     """Write one shot's prompt: {"text", "for"} (what it was made from, see auto_prompt_for)."""
@@ -3454,9 +3523,14 @@ def shot_signature(plan: dict, seg: dict, head: int, extra: dict) -> str:
     if (plan.get("auto_prompt") or {}).get("enabled"):   # the shot's written prompt is its prompt
         doc["g"]["auto_prompt"] = plan["auto_prompt"]
         doc["s"]["written"] = ((plan.get("auto_prompts") or {}).get(f"{seg.get('start')}-{seg.get('end')}") or {}).get("text", "")
-        kept = kept_picture_details(plan, shot_ref_names(seg.get("refs") or [], plan.get("global_refs") or []))
+        names = shot_ref_names(seg.get("refs") or [], plan.get("global_refs") or [])
+        kept = kept_picture_details(plan, names)
         if kept:   # its written prompt is written again with them (auto_prompt_for)
             doc["s"]["kept"] = kept
+        # 'use my prompt' on an older prompt: sent now, where an earlier run (or one queued before the switch) wrote a
+        # new one; on an up-to-date prompt the switch changes nothing that is sent, so it does not count
+        if locked_older(plan, seg, names, seg.get("prompt") or plan.get("global_prompt", ""), (extra or {}).get("prompt", "")):
+            doc["s"]["locked_older"] = True
     return hashlib.sha1(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -3867,26 +3941,28 @@ class BFSShotPlanner:
         ap = {**AUTO_PROMPT_DEFAULTS, **(p.get("auto_prompt") or {})}
         written, new_written = {}, {}
         if ap["enabled"]:
-            stored = p.get("auto_prompts") or {}
             template = prompt or ""
             for i in work:
                 key, request = f"{segs[i]['start']}-{segs[i]['end']}", segs[i]["prompt"] or p.get("global_prompt", "")
-                got = stored.get(key) or {}
-                if got.get("text") and got.get("for") != written_prompt_for(p, segs[i], names_of(segs[i]), request, template):
-                    if vlm is None:
-                        raise ValueError(f"Shot {i + 1}: written prompt is outdated after changes to request/pictures/marks, a kept ('use my description') picture description or writer rules. Use Write again in the panel, or connect the Planner VLM to regenerate it. The old prompt was not sent to generation.")
-                    print(f"[BFS Shot Planner] shot {i + 1}: regenerating outdated written prompt", flush=True)
-                    got = {}
-                if got.get("text"):
-                    written[i] = got["text"]
-                elif vlm is not None:
+                action, text = run_written_prompt(p, segs[i], names_of(segs[i]), request, template, vlm is not None,
+                                                  i + 1)
+                if action == "locked":   # 🔒 use my prompt: as the user wrote it, never dated or rewritten
+                    written[i] = text
+                    print(f"[BFS Shot Planner] shot {i + 1}: your prompt ('use my prompt'), sent as written", flush=True)
+                elif action == "stored":
+                    written[i] = text
+                elif action in ("write", "rewrite"):
+                    if action == "rewrite":
+                        print(f"[BFS Shot Planner] shot {i + 1}: regenerating outdated written prompt", flush=True)
                     new_written[key] = auto_prompt_shot(vlm, p, a, path, segs[i], names_of(segs[i]), refs_of(segs[i]),
                                                         pic_details, request, vcfg, template)
                     written[i] = new_written[key]["text"]
                     print(f"[BFS Shot Planner] shot {i + 1}: prompt written by the VLM ({len(written[i].split())} words)",
                           flush=True)
+                elif action != "fallback":   # guard only: run_written_prompt returns no other action
+                    raise RuntimeError(f"Shot {i + 1}: unknown written-prompt action {action!r}")
                 else:
-                    written[i] = template or request
+                    written[i] = text
                     print(f"[BFS Shot Planner] shot {i + 1}: Auto prompt is on, but the shot has no written prompt and the "
                           f"planner has no VLM: its {'template (prompt input)' if template else 'request'} is used as the "
                           "prompt", flush=True)
@@ -6355,7 +6431,7 @@ try:
     @PromptServer.instance.routes.post("/bfs/shotloop/autoprompt")
     async def _bfs_shot_autoprompt(request):
         """🤖 Auto prompt: the VLM writes the H3 prompt of some shots: body {plan, indices} -> {prompts: {"start-end":
-        {text, for}}}."""
+        {text, for}}}. Locked shots ('use my prompt') are left out."""
         body = await request.json()
 
         def work():
@@ -6363,12 +6439,15 @@ try:
             path = _input_path(p["video"])
             cfg = vlm_cfg(p.get("vlm_cfg"))
             details = saved_picture_details(p)
-            clip = panel_vlm(body.get("vlm_source"))
             a = analyze(path, float(p["fps"]))
             segs = resolve_plan(p, a, path)
+            todo = writable_shots(p, segs, body.get("indices"))
             out = {}
-            for i in body.get("indices") or range(len(segs)):
-                seg = segs[int(i)]
+            if not todo:   # every asked shot is locked ('use my prompt'): no VLM to load
+                return {"prompts": out}
+            clip = panel_vlm(body.get("vlm_source"))
+            for i in todo:
+                seg = segs[i]
                 names = shot_ref_names(seg["refs"], p["global_refs"])
                 out[f"{seg['start']}-{seg['end']}"] = auto_prompt_shot(
                     clip, p, a, path, seg, names, [_load_image(n) for n in names], details,

@@ -108,15 +108,25 @@ function editor(c, cur) {
       !cur.prompt && plan.global_prompt ? rawH("span", { class: "hint" }, `↳ uses the global prompt: ${plan.global_prompt.slice(0, 120)}${plan.global_prompt.length > 120 ? "…" : ""}`) : null,
     ]),
     plan.auto_prompt?.enabled ? (() => {
-      const w = c.writtenOf(cur), old = w?.text && w.for !== c.autoFor(cur);
+      const w = c.writtenOf(cur), lockOn = w?.lock === true, locked = !!c.lockedOf(cur);
+      const old = !locked && w?.text && w.for !== c.autoFor(cur);
       return h("div", { class: "note", style: "margin-top:6px;padding:6px 8px" }, [
         h("div", { class: "row", style: "gap:6px;align-items:center;margin-bottom:4px" }, [
-          h("b", "🤖 Written prompt"), old ? pill("older than the request / pictures / marks", "warn") : null, h("span", { class: "grow" }),
-          h("button", { class: w?.text ? "" : "pri", disabled: !!busy.value, onClick: () => c.writePrompts([i]) }, w?.text ? "🤖 Write again" : "🤖 Write"),
-          w?.text ? h("button", { class: "dng", title: "forget it: the next run writes a new one", onClick: () => c.setWritten(cur, "") }, "✕") : null,
+          h("b", "🤖 Written prompt"), old ? pill("older than the request / pictures / marks", "warn") : null,
+          locked ? pill("🔒 yours", "ok") : null, h("span", { class: "grow" }),
+          check(lockOn, v => c.setLock(cur, v), "use my prompt",
+            "🔒 The text below is this shot's prompt as you wrote it: never marked older, never rewritten by 🤖 Write / Write all prompts or by the run. Placeholders such as {details} and {target} are still filled. Off: the VLM writes it as usual."),
+          h("button", { class: w?.text ? "" : "pri", disabled: !!busy.value || locked,
+            title: locked ? "Turn off 'use my prompt' to let the VLM write this shot" : "", onClick: () => c.writePrompts([i]) },
+            w?.text ? "🤖 Write again" : "🤖 Write"),
+          w?.text ? h("button", { class: "dng", disabled: locked,
+            title: locked ? "Turn off 'use my prompt' to forget it" : "forget it: the next run writes a new one",
+            onClick: () => c.setWritten(cur, "") }, "✕") : null,
         ]),
+        lockOn && !locked ? hint("No prompt to keep yet: type it below (until then the switch does nothing).", "display:block;margin-bottom:3px") : null,
         h("textarea", { style: "min-height:140px;font-size:11px", value: w?.text || "",
-          placeholder: "not written yet: 🤖 Write, or the planner's VLM writes it when the workflow runs",
+          placeholder: lockOn ? "your prompt for this shot (sent as written; {details} {target} still filled)"
+            : "not written yet: 🤖 Write, or the planner's VLM writes it when the workflow runs",
           onChange: e => c.setWritten(cur, e.target.value) }),
       ]);
     })() : null,

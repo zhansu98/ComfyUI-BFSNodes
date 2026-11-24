@@ -2850,6 +2850,25 @@ class PanelRoutesHttpTest(unittest.TestCase):
             status, out = self._serve(go)
         self.assertEqual((status, out), (200, {"prompts": {"0-10": {"text": "written", "for": "x"}}}))
 
+    def test_auto_prompt_leaves_locked_shots_alone(self):
+        M = self.M
+        segs = [{"start": 0, "end": 10, "refs": [], "prompt": "p"}, {"start": 10, "end": 20, "refs": [], "prompt": "p"}]
+        loads, wrote = [], []
+        plan = {"video": "http.mp4", "auto_prompts": {"0-10": {"text": "mine", "lock": True}}}
+        with patch.object(M, "analyze", lambda path, fps: {}), patch.object(M, "resolve_plan", lambda p, a, path: segs), \
+             patch.object(M, "panel_vlm", lambda source=None, required=True: loads.append(1) or "clip"), \
+             patch.object(M, "auto_prompt_shot", lambda clip, p, a, path, seg, *r, **k: wrote.append(seg["start"])
+                          or {"text": "written", "for": "x"}):
+            async def go(s, base):
+                out = []
+                for indices in ([0], [0, 1]):   # only locked shots asked: nothing written, no VLM loaded
+                    r = await s.post(f"{base}/bfs/shotloop/autoprompt", json={"plan": plan, "indices": indices})
+                    out.append((r.status, await self._follow(s, base, r)))
+                return out
+            got = self._serve(go)
+        self.assertEqual(got, [(200, {"prompts": {}}), (200, {"prompts": {"10-20": {"text": "written", "for": "x"}}})])
+        self.assertEqual((loads, wrote), ([1], [10]))
+
     def test_a_frame_needs_no_analysis(self):
         """The points window's frame reads the video's header only: a first analysis (the whole video) would hold
         the request past the proxy's limit after a restart."""
@@ -2894,3 +2913,148 @@ class PanelRoutesHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(p["state"], "error")
         self.assertIn("ValueError", p["error"])
+
+
+class UseMyPromptTest(unittest.TestCase):
+    """🔒 'use my prompt': a shot's written prompt locked by the user is sent as written with Auto prompt on: never
+    dated, rewritten by 🤖 Write / the run, or the reason a run without a VLM stops."""
+    SEG = {"start": 0, "end": 24, "refs": [], "prompt": ""}
+    MINE = "motion_transfer: My own words for <Picture 1>, the {details}."
+
+    def plan(self, **entry):
+        return {"global_refs": [], "auto_prompt": {"enabled": True}, "auto_prompts": {"0-24": entry}}
+
+    def test_a_locked_prompt_is_sent_as_written(self):
+        stale = self.plan(text=self.MINE, **{"for": "made from something else"}, lock=True)
+        self.assertEqual(SL.stored_written_prompt(stale, self.SEG, [], "req"), ("locked", self.MINE))
+        current = self.plan(text=self.MINE, **{"for": SL.written_prompt_for({}, self.SEG, [], "req")}, lock=True)
+        self.assertEqual(SL.stored_written_prompt(current, self.SEG, [], "req"), ("locked", self.MINE))
+        # without the lock: the same prompts are checked as before
+        del stale["auto_prompts"]["0-24"]["lock"]
+        self.assertEqual(SL.stored_written_prompt(stale, self.SEG, [], "req"), ("outdated", self.MINE))
+        current["auto_prompts"]["0-24"]["lock"] = False
+        self.assertEqual(SL.stored_written_prompt(current, self.SEG, [], "req"), ("current", self.MINE))
+        self.assertEqual(SL.stored_written_prompt({"auto_prompts": {}}, self.SEG, [], "req"), ("missing", ""))
+
+    def test_a_lock_without_text_or_not_true_is_no_lock(self):
+        for entry in ({"text": " \t\n", "lock": True}, {"text": "", "lock": True}, {"lock": True},
+                      {"text": self.MINE, "lock": "true"}, {"text": self.MINE, "lock": 1},
+                      {"text": ["x"], "lock": True}):
+            self.assertEqual(SL.locked_prompt(self.plan(**entry), self.SEG), "", entry)
+        self.assertEqual(SL.locked_prompt({"auto_prompts": {"0-24": "x"}}, self.SEG), "")
+        self.assertEqual(SL.locked_prompt({"auto_prompts": None}, self.SEG), "")
+        self.assertEqual(SL.stored_written_prompt(self.plan(text=" ", lock=True), self.SEG, [], "r")[0], "outdated")
+        # only ASCII whitespace is trimmed (the panel's lockedPrompt); the text itself is never trimmed
+        self.assertEqual(SL.locked_prompt(self.plan(text="\u00a0", lock=True), self.SEG), "\u00a0")
+        self.assertEqual(SL.locked_prompt(self.plan(text="  mine \n", lock=True), self.SEG), "  mine \n")
+
+    def test_write_skips_locked_shots(self):
+        segs = [{"start": 0, "end": 24}, {"start": 24, "end": 48}, {"start": 48, "end": 72}]
+        plan = {"auto_prompts": {"24-48": {"text": "mine", "lock": True}, "48-72": {"text": " ", "lock": True}}}
+        self.assertEqual(SL.writable_shots(plan, segs), [0, 2])
+        self.assertEqual(SL.writable_shots(plan, segs, []), [0, 2])   # an empty list is every shot, as before
+        self.assertEqual(SL.writable_shots(plan, segs, ["1", 2]), [2])
+        self.assertEqual(SL.writable_shots(plan, segs, [1]), [])
+
+    def test_the_switch_does_not_rerender_but_the_text_does(self):
+        sig = lambda plan, tpl="": SL.shot_signature(plan, self.SEG, 0, {"prompt": tpl})
+        now = {"for": SL.written_prompt_for(self.plan(), self.SEG, [], "")}   # up to date (no request, no template)
+        self.assertEqual(sig(self.plan(text=self.MINE, **now)), sig(self.plan(text=self.MINE, **now, lock=True)))
+        self.assertNotEqual(sig(self.plan(text=self.MINE, **now, lock=True)),
+                            sig(self.plan(text=self.MINE + " x", **now, lock=True)))
+        # on an older prompt the switch does count: an earlier run (or one queued before the tick) wrote a new prompt
+        # for that shot, so the stored shot was not made from the text the lock now sends
+        old = {"for": "made from something else"}
+        self.assertNotEqual(sig(self.plan(text=self.MINE, **old)), sig(self.plan(text=self.MINE, **old, lock=True)))
+        # real stamps of an older request / pictures / trigger (compared as stamps, only the revision left out)
+        for older in (SL.written_prompt_for(self.plan(), self.SEG, [], "another request"),
+                      SL.written_prompt_for(self.plan(), self.SEG, ["a.png"], ""),
+                      SL.written_prompt_for({**self.plan(), "auto_prompt": {"enabled": True, "trigger": "body_swap"}},
+                                            self.SEG, [], "")):
+            self.assertNotEqual(sig(self.plan(text=self.MINE, **{"for": older})),
+                                sig(self.plan(text=self.MINE, **{"for": older}, lock=True)), older)
+        self.assertNotEqual(sig(self.plan(text=self.MINE, **now, lock=True)),
+                            sig(self.plan(text=self.MINE, **now, lock=True), "a new template"))
+        stamp = {"for": SL.written_prompt_for(self.plan(), self.SEG, [], "", "a new template")}   # the node's prompt input
+        self.assertEqual(sig(self.plan(text=self.MINE, **stamp), "a new template"),
+                         sig(self.plan(text=self.MINE, **stamp, lock=True), "a new template"))
+
+    def test_the_run_sends_locked_prompts_and_never_stops_on_them(self):
+        stamp = SL.written_prompt_for(self.plan(), self.SEG, [], "req")
+        run = lambda plan, vlm: SL.run_written_prompt(plan, self.SEG, [], "req", "", vlm, 3)
+        for vlm in (True, False):
+            self.assertEqual(run(self.plan(text=self.MINE, **{"for": "old"}, lock=True), vlm), ("locked", self.MINE))
+            self.assertEqual(run(self.plan(text=self.MINE, **{"for": stamp}, lock=True), vlm), ("locked", self.MINE))
+            self.assertEqual(run(self.plan(text=self.MINE, **{"for": stamp}), vlm), ("stored", self.MINE))
+        self.assertEqual(run(self.plan(text=self.MINE, **{"for": "old"}), True), ("rewrite", ""))
+        with self.assertRaisesRegex(ValueError, "Shot 3: written prompt is outdated.*use my prompt"):
+            run(self.plan(text=self.MINE, **{"for": "old"}), False)
+        self.assertEqual(run(self.plan(), True), ("write", ""))
+        self.assertEqual(run(self.plan(text=" \n", lock=True), True), ("rewrite", ""))   # a lock without text is no lock
+        self.assertEqual(run(self.plan(), False), ("fallback", "req"))
+        self.assertEqual(SL.run_written_prompt(self.plan(), self.SEG, [], "req", "tpl", False, 1), ("fallback", "tpl"))
+
+    def test_the_older_check_reads_the_shot_like_the_run(self):
+        # the request (the shot's, else the global one) and the shot's pictures, as the run's stamp: an up-to-date
+        # locked prompt stays unmarked, so ticking it re-renders nothing
+        seg = {"start": 0, "end": 24, "refs": ["a.png"], "prompt": "Shot request"}
+        for s, extra in ((seg, {}), ({**seg, "prompt": ""}, {"global_prompt": "Global request"})):
+            base = {**self.plan(), **extra, "global_refs": []}
+            stamp = SL.written_prompt_for(base, s, ["a.png"], s["prompt"] or extra.get("global_prompt", ""))
+            entry = {"text": self.MINE, "for": stamp}
+            plain = {**base, "auto_prompts": {"0-24": entry}}
+            locked = {**base, "auto_prompts": {"0-24": {**entry, "lock": True}}}
+            self.assertEqual(SL.shot_signature(plain, s, 0, {}), SL.shot_signature(locked, s, 0, {}))
+
+    def test_a_bfs_update_of_the_writer_does_not_rerender_locked_shots(self):
+        stamp = SL.written_prompt_for(self.plan(), self.SEG, [], "")
+        sig = lambda plan: SL.shot_signature(plan, self.SEG, 0, {})
+        before = sig(self.plan(text=self.MINE, **{"for": stamp}, lock=True))
+        with patch.object(SL, "AUTO_PROMPT_REVISION", "fitted-picture-details-v999"):
+            self.assertEqual(sig(self.plan(text=self.MINE, **{"for": stamp}, lock=True)), before)
+            # also with a kept description (its text after the revision in the stamp), which still counts
+            seg = {**self.SEG, "refs": ["a.png"]}
+            kept = {**self.plan(text=self.MINE, lock=True), "picture_details": {"a.png": "red scarf"},
+                    "picture_cfg": {"a.png": {"keep": True}}}
+            with patch.object(SL, "AUTO_PROMPT_REVISION", "fitted-picture-details-v8"):
+                kept_stamp = SL.written_prompt_for(kept, seg, ["a.png"], "")
+            kept["auto_prompts"]["0-24"]["for"] = kept_stamp
+            unlocked = {**kept, "auto_prompts": {"0-24": {"text": self.MINE, "for": kept_stamp}}}
+            self.assertEqual(SL.shot_signature(kept, seg, 0, {}), SL.shot_signature(unlocked, seg, 0, {}))
+            edited = {**kept, "picture_details": {"a.png": "blue scarf"}}
+            unlocked_edited = {**edited, "auto_prompts": {"0-24": {"text": self.MINE, "for": kept_stamp}}}
+            self.assertNotEqual(SL.shot_signature(edited, seg, 0, {}), SL.shot_signature(unlocked_edited, seg, 0, {}))
+            # (an unlocked prompt is written again on such an update, as before)
+            self.assertEqual(SL.stored_written_prompt(self.plan(text=self.MINE, **{"for": stamp}), self.SEG, [], "")[0],
+                             "outdated")
+
+    def test_browser_locks_like_the_backend(self):
+        import json
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        src = (ROOT / "web/js/bfs_shot_loop.js").read_text(encoding="utf-8")
+        helper = src[src.index("function lockedPrompt"):src.index("const viewUrl")]
+        merge = src[src.index("const mergeWritten ="):src.index("// the VLM writes the prompts of these shots")]
+        entries = [{"text": "mine", "lock": True}, {"text": "mine"}, {"text": " \t\n", "lock": True},
+                   {"text": "\u00a0", "lock": True}, {"text": "\ufeff", "lock": True}, {"text": " a\u2028 ", "lock": True},
+                   {"text": "x", "lock": "true"}, {"text": "x", "lock": 1}, {"text": 5, "lock": True}, {"lock": True},
+                   "x", None, []]
+        plans = [{"auto_prompts": {"0-24": e}} for e in entries] + [{"auto_prompts": {}}, {}]
+        keys = ["0-24"] * len(entries) + ["constructor", "0-24"]   # no prototype lookups
+        script = (helper + "\nlet plan;\n" + merge +
+                  "\nconst cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+                  "const locks = cases.map(([p, k]) => lockedPrompt(p, k));\n"
+                  "plan = { auto_prompts: { 'a': { text: 'mine', lock: true }, 'b': { text: 'old' }, 'c': { text: ' ', lock: true } } };\n"
+                  "mergeWritten({ a: { text: 'vlm' }, b: { text: 'vlm' }, c: { text: 'vlm' }, d: { text: 'vlm' } });\n"
+                  "console.log(JSON.stringify([locks, plan.auto_prompts]));")
+        run = subprocess.run([node, "-e", script], input=json.dumps(list(zip(plans, keys))), capture_output=True,
+                             text=True, encoding="utf-8")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        locks, merged = json.loads(run.stdout)
+        want = [SL.locked_prompt({"auto_prompts": {"0-24": e}}, self.SEG) for e in entries] + ["", ""]
+        self.assertEqual(locks, want)
+        self.assertEqual(merged, {"a": {"text": "mine", "lock": True}, "b": {"text": "vlm"}, "c": {"text": "vlm"},
+                                  "d": {"text": "vlm"}})   # a shot locked meanwhile keeps its prompt

@@ -465,6 +465,19 @@ it again with the planner's VLM, and without one the run stops and asks you to �
 never sent to generation). A written prompt is part of the stored shot's signature, so editing it re-renders the shot.
 Without a VLM and without a written prompt, the template (else the request) is used as the prompt.
 
+**Use my prompt (1.123.0):** to give one shot a prompt of your own while Auto prompt stays on for the others, tick
+**use my prompt** next to its 🤖 Written prompt and type (or paste, or edit what the VLM wrote) the prompt there. A
+locked prompt (🔒 *yours*) is sent to generation as written: it is never marked *older*, the run never writes it again
+(also without a VLM, it never stops the run), and **🤖 Write all prompts**, *only the missing* and the shot's own 🤖 Write
+skip it (its 🤖 Write and ✕ are off while it holds your prompt). Placeholders such as `{details}` and `{target}` are still
+filled, so leave them out to send only your words. With an empty box (or only spaces) the switch does nothing: the
+shot behaves as without it, its 🤖 Write stays on, and a prompt the VLM writes there replaces the switch. Ticking or
+unticking it on an up-to-date prompt does not re-render the stored shot, and editing the text does; ticking it on an
+*older* prompt re-renders the shot once, since an earlier run (or one already queued) wrote and rendered a new prompt
+in its place. A BFS update of the prompt writer never re-renders a locked shot. Untick it to hand the shot back to the
+VLM: from then on it is checked and rewritten like any other. The switch belongs to the shot's frame range, like its
+written prompt: moving, splitting or merging the shot's cuts leaves the new shot without it.
+
 ### One description per picture (1.113.0)
 
 Descriptions are per picture: **📝 Describe refs** describes every picture the plan uses by itself, once per image
