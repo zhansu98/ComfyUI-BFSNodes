@@ -429,8 +429,8 @@ writes each shot's MiniMax H3 prompt in the official full-reference format (Mini
 `detailed_description` (`[Shot 1]`, the official camera vocabulary, sounds in time), `overall_soundscape` and
 `non_diegetic_music`. It looks at:
 
-- **key frames of the shot** (*Key frames*: auto = about 1.5 per second, 3 to 8), read first on their own (see *What
-  the VLM saw in the source* below);
+- **frames of the shot**, read first on their own in two looks: a few large *Key frames* and many small *Motion
+  frames* (see *Two looks, your notes and temporary conditions* below);
 - **the shot's pictures** and their descriptions (Describe references);
 - **the request**, the shot's **Colored Marks** (which tinted person becomes which picture; the mapping is added if the
   writer leaves a color out), its selection / `{target}` and its mode (*Mask only*: only the subject is regenerated;
@@ -489,10 +489,10 @@ open **👁 What the VLM saw in the source** under the shot's 🤖 Written promp
 size the VLM was shown and their times into the shot; the ComfyUI console prints the notes with the frame count and
 size (`[BFS Auto prompt] shot …: the VLM saw in the source …`). Read them when a prompt is off. If the notes are right,
 the writer went wrong: 🤖 Write again, or sharpen the request. If the notes are wrong or thin, the cheapest fix for one
-shot is to edit its prompt and tick **use my prompt**. To give the look more to see for every shot, raise **Image max
-side (VLM)** (small faces, hands, people in the background) or **Key frames** (fast or long action) and write again —
-but **changing either setting re-renders every stored shot**, not only the one you rewrite: both are part of each
-stored shot's signature (as before 1.124.0). The notes themselves are for reading only: they never mark a prompt
+shot is to edit its prompt and tick **use my prompt**. From 1.125.0 you can also tell the VLM what it misses and give
+it more frames or larger ones without touching any other stored shot (next paragraphs). **Image max side (VLM)** is
+the one setting here that **re-renders every stored shot** when it changes: it is part of each stored shot's
+signature. The notes themselves are for reading only: they never mark a prompt
 *older* and never re-render a stored shot, editing the prompt keeps them (under *use my prompt* they no longer feed
 it), and ✕ forgets them with the prompt. If the writer fails, the notes of that try are only in the console. Prompts
 written before 1.124.0 have none until they are written again. The notes describe what is in your video and are saved
@@ -501,9 +501,100 @@ in the workflow with the written prompts.
 From 1.124.0 the source frames reach the VLM at *Image max side (VLM)* in the shot's own aspect (before, always shrunk
 into a 448 px square with grey bars), all key frames in one request. For a 16:9 video that is about 3 times the pixels
 at the default 1024 px and about 12 times at 2048 px (more for squarer videos), so this look can be slower and need
-more VRAM at high settings; an empty look (*nothing*) can mean it was too much for the model. 448 px gives at most the
-old source-look cost, but the setting also sizes the pictures and other VLM looks, and changing it re-renders stored
-shots as said above.
+more VRAM at high settings; an empty look (*nothing*) can mean it was too much for the model. The setting also sizes
+the pictures and other VLM looks, and changing it re-renders stored shots as said above. (From 1.125.0 the source is
+read in two looks and the large frames have a size setting of their own: see below.)
+
+**Two looks, your notes and temporary conditions (1.125.0):** the VLM now looks at each shot twice before the prompt
+is written, and you can tell it what to look for.
+
+- **Key frames** (the first look): a few **large** frames, at *Key frame size*, for who is in the shot, clothes, faces,
+  the place and the light. *auto* gives 2 to 4 (half of what 1.124.0 used), or 3 to 8 when the motion look is off. A
+  number you choose is used as it is, and the motion look comes on top of it (8 key frames on a 5 s shot: 8 large + 20
+  small, about one and a half times the cost of 1.124.0).
+- **Motion frames** (the second look): many **small** frames, each given to the VLM with its time into the shot, for
+  what happens, in which order, and what the camera does. *auto* gives about 4 per second, 8 to 24 (fewer where
+  that would cost much more than before, see *Cost*); you can set 8 to 32, or *off* for one look as in 1.124.0. The small frames are half the key frames' size, 224 to 448 px. This look
+  also gets the first look's notes, so the actors keep the same names. It is asked to answer in order, **without**
+  times. Sending every frame of the shot is not offered: neighbouring frames are nearly the same picture, and the
+  model reads them as separate stills, not as video.
+- **Key frame size**: *as Image max side (VLM)*, or its own size, 448 to 2048 px, for the large frames only (the small
+  ones follow). Larger shows small things on faces in wide shots and costs VLM time and memory; smaller costs less.
+- **Cost.** For a 16:9 video and Qwen3-VL a 1024 px frame is about 576 vision tokens and a 448 px one about 112. At
+  the default 1024 px a 5 s shot was 8 large frames (4608) in 1.124.0 and is now 4 large + 20 small (4544). With *Key
+  frames* and *Motion frames* on auto, the two looks together cost at most about 1.25 times the single look of 1.124.0
+  in vision tokens (measured maximum 1.26) for 16:9, 9:16, 1:1 and 4:3 video, at every *Image max side* and *Key frame
+  size* the panel offers; other shapes (2:1, 3:2, 4:5, very wide) can reach about 1.3 to 1.4. Neither request is
+  larger than that single look; for a shot without cuts inside, from 1280 px up they cost about the same or less. A
+  shot with camera cuts inside keeps
+  one large frame per piece; when the small frames would show no more moments than the key frames (many cuts, a very
+  short shot), there is no motion look and the shot is read exactly as in 1.124.0. A *Key frames* or *Motion frames*
+  number of your own is used as it is and is not capped. The second look is one more answer to generate, so writing a
+  shot's prompt takes longer than before.
+
+**Your notes.** Two boxes, both optional, at most 600 characters each:
+
+- **Instruction for the looks** (Prompts & refs, in the 🤖 Auto prompt card): how the VLM should look, for every shot,
+  e.g. *this is a dance video: name each move* or *ignore the crowd in the background*. Both looks read it. The prompt
+  writer does not: it reaches the prompt only through what the looks then notice. It describes the source video, so
+  choosing another video clears it (the frame settings beside it stay).
+- **The shot's note** (Shots tab, above the shot's 🤖 Written prompt): **facts** about this shot's source that the VLM
+  may miss, e.g. *tears on both cheeks from the start; he enters from the right at the end*. Both looks read it, **and
+  the prompt writer gets it as a fact about the source performance** that wins over the VLM's own notes. Write facts
+  here, not instructions (*ignore the crowd* belongs in the instruction above: the writer would take it as something
+  that happens). Say when with words (*at the start*, *after she turns*, *at the end*), not seconds: the note is sent
+  as you type it, and a time in it can end up in the prompt. Writing, editing or locking the prompt, running the
+  workflow and opening it again keep the note; splitting a shot by hand copies it to both halves. A note stays with
+  the shot's **number**, like its request and `{target}`: after ✂ Auto split, a Range change or a cut you move, the
+  same number can cover other frames. The panel marks such a note in amber (*typed when this shot covered other
+  frames*); check that it still fits, and edit it to confirm it.
+
+**Nothing here re-renders other shots.** Key frames, Motion frames, Key frame size, the instruction and the notes are
+kept apart from the settings a stored shot is checked against. Changing them never renders a stored shot again and
+never marks a prompt *older*, so no run rewrites a prompt because of them. They apply to prompts written after the
+change: click 🤖 Write again on the shots you want redone (a shot whose prompt text changes is rendered again, as
+always). A grey line *look settings or notes changed since this prompt was written* marks such shots; it is a
+reminder, not the *older* state, and ✕ on a prompt forgets what it was written with. (*Key frames* used to be part of
+the stored shot's signature; a value you set before 1.125.0 keeps working until you touch the new control.)
+*Image max side (VLM)* is still part of it: use *Key frame size* to change the large frames alone.
+
+**What you see.** 👁 *What the VLM saw in the source* now shows both looks: the key frames' notes, then the motion
+notes as the VLM wrote them, each with its frame count and size, and the notes of yours they were made with. The
+writer gets the motion lines in order, with no numeric time and no frame, image or picture number: a label or time
+in front of a line is removed, and a sentence that still names one, or holds a number that is not plainly a count
+or part of a name (*Person 2*, *2 bottles* and *claps 3 times* stay; *1.5x*, *90°* or a line of more than 600
+characters do not), is **left out whole** and counted, never cut to pieces (the block says how many, the console
+lists them). The filter is cautious on purpose: when in doubt it leaves a sentence out, and when it leaves out as
+many as it keeps the motion look is not used at all (next paragraph). If the VLM starts its lines with a time that
+does not end at a comma or a colon (*At 1.2 s he turns*, *After 2 seconds he turns*), every such line is left out. Pace in words without a number (*a second later*, *in the
+last frames*) stays: that is what the look is asked for.
+
+**When the motion look gives nothing usable.** The motion notes are used only when more sentences are kept than left
+out. Otherwise (an empty answer, an error such as out of memory, or an answer full of times) the writer gets none of
+them, the shot still gets its prompt, and it says what happened in an amber line under the written prompt:
+
+- usually the key frames are looked at again in full, as with *Motion frames* off, and the prompt is written from
+  that second look;
+- if that second look answers nothing or fails, the prompt is written from the first, smaller set of key frames, and
+  the line says so (fewer key frames than *Motion frames* off uses);
+- with a *Key frames* number of your own, or when a second look would show the same frames, there is no second look:
+  the prompt is written from those key frames.
+
+The 👁 block shows the errors, the Auto prompt card counts such shots and the console prints a `WARNING`. 🤖 Write
+again tries the motion look again; fewer *Motion frames* may help. Cancelling a run still stops it, and an error in
+the key frames' first look or in the writer stops the write as before.
+
+**Temporary conditions.** Tears, wet or reddened eyes, sweat, water or another liquid on the face or skin, wet hair,
+flushed skin, dirt, smeared make-up, visible breath: the first look now asks for these per actor (what, where, and
+from when), and the writer carries them over to the subject that replaces that actor, at the same place and moment,
+as part of the performance. The source actor's **lasting** appearance (face, hair, skin tone, clothing, accessories)
+still does not transfer: the replacement keeps the look of its own picture, with the condition on top. A request
+that removes or changes a condition wins. Limits: in a wide shot a tear is a few pixels and can be missed even at a
+large *Key frame size* (there are no face close-ups); the shot's note is the sure way: *tears on both cheeks from the
+start* reaches the writer whatever the VLM saw.
+
+**Prompts you already have** are not touched by the update: they keep their text and were written with the old rules
+(one look, no temporary conditions) until you 🤖 Write them again.
 
 ### One description per picture (1.113.0)
 

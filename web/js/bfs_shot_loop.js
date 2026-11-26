@@ -47,14 +47,55 @@ function lockedPrompt(plan, key) {
 }
 
 // 🤖 Auto prompt: what the VLM said it saw in the shot's source frames when it last wrote this prompt (the entry's
-// "seen", from bfs_shot_loop.auto_prompt_shot), or null: {text, frames, width, height, times}. An empty text is a look
+// "seen", from bfs_shot_loop.auto_prompt_shot), or null: {text, frames, width, height, times} for the large key frames
+// and, when the motion look ran (1.125.0), the same five under `motion` for the small frames (plus error / left_out /
+// unused when something went wrong with it). An empty text is a look
 // that answered nothing; a number that is missing or not positive is 0.
 function sourceLook(entry) {
   const s = entry && typeof entry === "object" ? entry.seen : null;
   if (!s || typeof s !== "object" || typeof s.text !== "string") return null;
   const n = v => (Number.isFinite(v) && v > 0 ? v : 0);
-  return { text: s.text, frames: n(s.frames), width: n(s.width), height: n(s.height),
-           times: Array.isArray(s.times) ? s.times.filter(Number.isFinite) : [] };
+  const one = x => ({ text: x.text, frames: n(x.frames), width: n(x.width), height: n(x.height),
+                      times: Array.isArray(x.times) ? x.times.filter(Number.isFinite) : [] });
+  // only when they apply: the motion look failed (error), how many sentences were not given to the writer
+  // (left_out), the writer got none of the motion notes (unused), the key frames were then looked at again in full and
+  // how that ended (again: "used" | "empty" | "failed", with again_error)
+  const more = x => ({ ...(typeof x.error === "string" && x.error ? { error: x.error } : {}),
+                       ...(n(x.left_out) ? { left_out: n(x.left_out) } : {}), ...(x.unused === true ? { unused: true } : {}),
+                       ...(["used", "empty", "failed"].includes(x.again) ? { again: x.again } : {}),
+                       ...(typeof x.again_error === "string" && x.again_error ? { again_error: x.again_error } : {}) });
+  const m = s.motion;
+  return m && typeof m === "object" && typeof m.text === "string" ? { ...one(s), motion: { ...one(m), ...more(m) } } : one(s);
+}
+
+// what to say, outside the collapsed block, about a shot whose motion look gave the writer nothing ("" otherwise):
+// `look` is sourceLook's answer, and its frames are the key frames the prompt was written from
+function motionSaid(look) {
+  const m = look && look.motion;
+  if (!m || m.unused !== true) return "";
+  const n = look.frames, tail = " 🤖 Write again to try it again; the reason is under 'What the VLM saw'.";
+  if (m.again === "used") return `⚠ The motion look gave nothing usable for this shot, so its prompt was written from a second look at ${n} key frames, as with Motion frames off.${tail}`;
+  if (m.again === "empty") return `⚠ The motion look gave nothing usable for this shot and a second look at more key frames answered nothing: its prompt was written from the first ${n} key frames only, fewer than Motion frames off uses.${tail}`;
+  if (m.again === "failed") return `⚠ The motion look gave nothing usable for this shot and a second look at more key frames failed: its prompt was written from the first ${n} key frames only, fewer than Motion frames off uses.${tail}`;
+  return `⚠ The motion look gave nothing usable for this shot: its prompt was written from its ${n} key frames alone.${tail}`;
+}
+
+// 🤖 Auto prompt: what the looks at the source are made with now (bfs_shot_loop.look_settings and the two notes, as
+// auto_prompt_shot records them in a written prompt's `look`): the settings of plan.auto_look, with the Key frames
+// stored before 1.125.0 (auto_prompt.frames) until the new control is used, and this shot's note
+function lookNow(plan, note) {
+  const L = plan.auto_look && typeof plan.auto_look === "object" ? plan.auto_look : {};
+  return { motion: L.motion == null || L.motion === "" ? "auto" : String(L.motion),
+           detail: (L.detail != null ? L.detail : plan.auto_prompt?.frames) || 0, side: parseInt(L.side) || 0,
+           video: typeof L.instruction === "string" ? L.instruction : "", shot: typeof note === "string" ? note : "" };
+}
+// true when a written prompt was made with other look settings or notes: a soft hint, never the "older" state (a
+// prompt written before 1.125.0 records none and gets no hint)
+function lookChanged(entry, plan, note) {
+  const made = entry && typeof entry === "object" ? entry.look : null;
+  if (!made || typeof made !== "object") return false;
+  const now = lookNow(plan, note);
+  return ["motion", "detail", "side", "video", "shot"].some(k => String(made[k] ?? "") !== String(now[k] ?? ""));
 }
 
 const viewUrl = name => {
@@ -179,6 +220,9 @@ function Panel(io) {
     plan.picture_cfg = { ...(p.picture_cfg || {}) };
     plan.auto_prompt = { ...AUTO_DEFAULTS, ...(p.auto_prompt || {}) };
     plan.auto_prompts = { ...(p.auto_prompts || {}) };
+    // the looks at the source (1.125.0): their own key, never merged into auto_prompt or vlm_cfg, which every stored
+    // shot's signature hashes whole
+    plan.auto_look = { ...(p.auto_look || {}) };
     if (!Array.isArray(plan.bounds)) plan.bounds = [];
     if (!Array.isArray(plan.segs)) plan.segs = [];
     // plans before 1.113 had two references (ref / ref2): now a list of up to MAX_REFS pictures
@@ -232,6 +276,7 @@ function Panel(io) {
                  color_guide: !!m.color_guide, color_guide_picture: +m.color_guide_picture || 1,
                  color_guide_opacity: m.color_guide_opacity ?? 0.35, regions: markRegions(m),
                  crop: !!m.crop, inpaint: !!m.inpaint, paste: !!m.paste, pasteText: m.paste_text || "", strength: m.strength ?? 1, mask: m.mask || {}, target: m.target || "",
+                 look_note: m.look_note || "", look_note_for: m.look_note_for || "",
                  extMask: !!plan.mask_video || !!(plan.track?.points?.length), trackMask: !!(plan.track?.points?.length) });
     }
     out.forEach(s => { s.names = shotRefNames(s.refs, plan.global_refs); [s.ref = "", s.ref2 = ""] = s.refs; });
@@ -377,6 +422,9 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
         const keep = plan.segs; plan.segs = j.segs.map((_, i) => ({ enabled: true, refs: refList(keep[i]?.refs), prompt: keep[i]?.prompt || "",
           chain: keep[i]?.chain || "head", chain_frame: keep[i]?.chain_frame || "first", chain_history: historyLen(keep[i]?.chain_history),
           crop: !!keep[i]?.crop, inpaint: !!keep[i]?.inpaint, paste: !!keep[i]?.paste, paste_text: keep[i]?.paste_text || "", strength: keep[i]?.strength ?? 1, mask: keep[i]?.mask || {}, target: keep[i]?.target || "",
+          // your note about the shot's source stays with the shot's number, like its request, with the frames it was
+          // typed for (the panel marks a note whose shot now covers other frames)
+          look_note: keep[i]?.look_note || "", look_note_for: keep[i]?.look_note_for || "",
           color_guide: !!keep[i]?.color_guide, color_guide_picture: keep[i]?.color_guide_picture || 1, color_guide_opacity: keep[i]?.color_guide_opacity ?? 0.35,
           color_guide_regions: (keep[i]?.color_guide_regions || []).map(r => ({ ...r })) }));
         sel.value = 0; save();
@@ -602,12 +650,24 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   // 🔒 use my prompt: the shot's written prompt is sent as written, never dated or rewritten
   const lockedOf = s => lockedPrompt(plan, segKey(s));
   const setAuto = (k, v) => { plan.auto_prompt = { ...plan.auto_prompt, [k]: v }; save(); };
-  // an edit keeps what the VLM saw in the source; forgetting the prompt (✕, an emptied box) forgets that too
+  // the looks at the source: Key frames, Motion frames, Key frame size and your instruction (plan.auto_look), and
+  // your note about one shot's source (in the shot's own settings, so no write, edit, lock or run can lose it)
+  const setLook = (k, v) => { plan.auto_look = { ...(plan.auto_look || {}), [k]: v }; save(); };
+  const setLookNote = (i, v) => {
+    const s = segs.value[i];   // the frames the note is typed for: only the panel reads it (never the server)
+    Object.assign(meta(i), { look_note: v, look_note_for: v && s ? segKey(s) : "" }); save();
+  };
+  const lookChangedOf = s => lookChanged(writtenOf(s), plan, s.look_note);
+  // an edit keeps what the VLM saw in the source and what the looks were made with; forgetting the prompt (✕, an
+  // emptied box) forgets both
   const setWritten = (s, text) => {
-    const k = segKey(s), { seen, ...cur } = plan.auto_prompts[k] || {};
-    plan.auto_prompts = { ...plan.auto_prompts, [k]: { ...cur, text, for: cur.for ?? autoFor(s), ...(text && seen ? { seen } : {}) } }; save();
+    const k = segKey(s), { seen, look, ...cur } = plan.auto_prompts[k] || {};
+    plan.auto_prompts = { ...plan.auto_prompts, [k]: { ...cur, text, for: cur.for ?? autoFor(s), ...(text && seen ? { seen } : {}), ...(text && look ? { look } : {}) } }; save();
   };
   const seenOf = s => sourceLook(writtenOf(s));
+  // the motion look gave the writer nothing (it failed, answered nothing, or only named times): written as with one look
+  const motionFailedOf = s => !!seenOf(s)?.motion?.unused;
+  const motionSaidOf = s => motionSaid(seenOf(s));
   const setLock = (s, on) => {
     const k = segKey(s), { lock, ...cur } = plan.auto_prompts[k] || {};
     plan.auto_prompts = { ...plan.auto_prompts, [k]: on ? { text: "", ...cur, lock: true } : cur }; save();
@@ -743,8 +803,11 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
 
   // ---- editing
   const setVideo = v => {
+    const other = v !== plan.video;
     plan.video = v; plan.bounds = []; plan.segs = [];
     if (v) {
+      // the instruction for the looks describes the source video (the look settings beside it do not): not this one's
+      if (other && plan.auto_look?.instruction) plan.auto_look = { ...plan.auto_look, instruction: "" };
       // A new source starts as one manageable clip. The user can widen the range or ask for an automatic split later;
       // do not surprise them with a wall of detected shots on first load.
       plan.mode = "single";
@@ -968,7 +1031,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     applySug, applyAllSug, setCastOpt, setGlobalMaskVideo, setFilter, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
     frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describable, keptPictureDetails, describePictures, setPictureDetail, setPictureCfg,
     setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
-    autoFor, writtenOf, lockedOf, seenOf, setAuto, setWritten, setLock, writePrompts,
+    autoFor, writtenOf, lockedOf, seenOf, setAuto, setWritten, setLock, writePrompts, setLook, setLookNote, lookChangedOf, motionFailedOf, motionSaidOf,
   };
 
   return () => {

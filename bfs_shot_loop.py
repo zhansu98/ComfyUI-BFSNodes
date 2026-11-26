@@ -584,6 +584,7 @@ def resolve_plan(plan: dict, analysis: dict, path: str | None = None) -> list[di
         s["strength"] = min(1.0, max(0.05, float(m.get("strength") or 1.0)))
         s["mask"] = m.get("mask") or {}
         s["target"] = m.get("target") or ""
+        s["look_note"] = str(m.get("look_note") or "")   # the user's note about this shot's source (Auto prompt)
         s["cut_before"] = bool(s.get("cut_before")) or (s["start"] in cuts)
         s["gen_len"] = snap_up(s["end"] - s["start"], grid)
         s["people"], s["main"] = [], -1
@@ -2479,6 +2480,356 @@ def auto_frame_count(length: int, fps: float, frames: int = 0) -> int:
     return max(3, min(8, round(length / max(1.0, fps) * 1.5)))
 
 
+# ---- the looks at the source (1.125.0)
+# The writer never sees the video: it composes from what the VLM noted about the shot's frames. Two looks: a few LARGE
+# key frames (who, clothes, place, light, temporary conditions such as tears) and many SMALL frames with their times
+# (actions, camera). Their settings live in plan["auto_look"] and each shot's note in its "look_note": neither is in a
+# stored shot's signature (shot_signature) or in a written prompt's stamp (auto_prompt_for), so changing them never
+# renders a stored shot again and never dates a prompt. They apply to prompts written after the change.
+
+MOTION_SIDE = 448        # the small frames' longest side at most (16:9: 448x252, 112 vision tokens each for
+                         # Qwen3-VL); see motion_side
+LOOK_NOTE_LIMIT = 600    # characters of an instruction or a note that reach the VLM
+
+SOURCE_QUESTION = (
+    "These images are ONLY chronological frames of the SOURCE video, not replacement "
+    "references. Describe the visible actors separately, their apparent gender when clear, "
+    "distinctive source clothing, initial positions, actions and interactions through the frames. "
+    "Keep each actor identifiable as positions change. Describe the observed setting, medium, "
+    "lighting and camera. Do not invent unseen movements or infer sound from silent frames. "
+    "Do not assign any Picture reference: none is shown here. Return concise English observations."
+    " Then look closely at each actor's face, skin and hair for temporary conditions: things that belong to this "
+    "moment of the performance and not to the person, such as tears, wet or reddened eyes, sweat, water or another "
+    "liquid on the face or skin, wet hair, flushed or reddened skin, dirt, smeared make-up or visible breath. Finish "
+    "with a part that starts with 'Temporary conditions:' and gives one line per actor who shows one: which actor, "
+    "what, where on the face or body, and whether it is there from the first frame or appears or changes in later "
+    "frames. Report only what is clearly visible, never guess, and write 'Temporary conditions: none seen.' when "
+    "there is none.")
+
+# appended to the writer's rules by auto_prompt_shot (write_h3_prompt's carry_conditions), with the line of its format
+AUTO_CONDITION_RULES = """Temporary conditions of the performance (this rule comes last and narrows the appearance rules above):
+- A temporary condition is a state of the source actor's face, skin or hair that belongs to this moment of the performance and not to the person: tears, wet or reddened eyes, sweat, water or another liquid on the face or skin, wet hair, flushed or reddened skin, dirt, smeared make-up, visible breath. It is performance, like an expression.
+- Carry every temporary condition that the source observations or the user's facts name over to the subject that replaces that actor: the same condition, in the same place on the face or body, at the same moment and with the same change (it appears, runs down, is wiped away, dries). Describe it on the replacing subject's own face, skin, fur or hair.
+- Nothing else of the source actor comes with it. The source actor's lasting appearance (face shape, age, skin tone, hair style and colour, build, clothing, jewellery, glasses and other accessories) still does not transfer: the replacement keeps the appearance of its own picture, with the temporary condition on top.
+- Write only conditions that are named in the source observations or the user's facts. Never invent one, and write nothing about conditions when none is named ('none seen' means none). A request that removes or changes a condition wins."""
+AUTO_CONDITION_H3 = ("Where to write it: in detailed_description, on the subject's <Subject N> label at the moment the "
+                     "condition is seen. subject_definitions keeps describing the reference picture only.")
+AUTO_CONDITION_TEMPLATE = ("Where to write it: in the sentences you add after [Shot 1], on the template's own label for "
+                           "the replacing subject, at the moment the condition is seen. Leave the template's other "
+                           "sentences as they are.")
+AUTO_CONDITION_CAPTION = ("Where to write it: in one short clause right after the replacement the condition belongs to, "
+                          "naming its <Picture n>.")
+
+
+def clean_note(text, limit: int = LOOK_NOTE_LIMIT) -> str:
+    """An instruction or note of the user as it reaches the VLM: one line (so it cannot open a block of its own, such
+    as a request or a template), no braces (no placeholder), at most `limit` characters, cut at a space."""
+    if not isinstance(text, str):
+        return ""
+    t = re.sub(r"[\x00-\x1f\x7f]", " ", text).replace("{", "(").replace("}", ")")
+    t = " ".join(t.split())
+    if len(t) > limit:
+        cut = t[:limit]
+        t = (cut[:cut.rindex(" ")] if " " in cut else cut).rstrip()
+    return t
+
+
+def look_settings(plan: dict) -> dict:
+    """plan["auto_look"] with its defaults: {"motion": "auto" | "off" | 4..32 (small frames), "detail": 0 = auto, else
+    the number of large key frames (the Key frames stored before 1.125.0, auto_prompt.frames, until the new control
+    is used), "side": 0 = the VLM's Image max side, else the large frames' longest side, "instruction": as typed}."""
+    look = plan.get("auto_look") if isinstance(plan.get("auto_look"), dict) else {}
+
+    def number(value) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+    m = look.get("motion")
+    if m is None or m == "" or m == "auto":
+        motion = "auto"
+    elif m is False or m in (0, "0", "off"):
+        motion = "off"
+    else:
+        try:
+            motion = max(4, min(32, int(m)))
+        except (TypeError, ValueError):
+            motion = "auto"
+    detail = look["detail"] if look.get("detail") is not None else (plan.get("auto_prompt") or {}).get("frames")
+    side = number(look.get("side"))
+    return {"motion": motion, "detail": number(detail), "side": max(224, min(4096, side)) if side else 0,
+            "instruction": look["instruction"] if isinstance(look.get("instruction"), str) else ""}
+
+
+def motion_frame_count(length: int, fps: float, motion) -> int:
+    """Small frames of the motion look: the plan's number, or about 4 per second (8 to 24); never more than the shot
+    has, and 0 (no motion look) when it is off or the shot has fewer than 2 frames."""
+    if motion == "off":
+        return 0
+    n = max(8, min(24, round(length / max(1.0, fps) * 4))) if motion == "auto" else int(motion)
+    n = min(n, int(length))
+    return n if n >= 2 else 0
+
+
+def motion_side(large: int) -> int:
+    """The small frames' longest side: half the large frames', 224 to 448 px (look_frames caps how many there are)."""
+    return min(MOTION_SIDE, max(224, int(large) // 2))
+
+
+def detail_frame_count(length: int, fps: float, detail: int, motion_on: bool) -> int:
+    """Large key frames: the plan's number, or by length as before (auto_frame_count: 3 to 8), halved (2 to 4) when the
+    small frames carry the motion, which keeps the two looks at about the cost of the one before."""
+    if detail:
+        return auto_frame_count(length, fps, detail)
+    n = auto_frame_count(length, fps, 0)
+    return max(2, (n + 1) // 2) if motion_on else n
+
+
+# the two looks together against the one look of 1.124.0, in vision tokens, at default settings. The cap goes by the
+# frames' sides, not by their real token counts: about 1.25 for 16:9, 9:16, 1:1 and 4:3 video; measured for other
+# shapes: 1.32 (4:5), 1.33 (3:2), 1.36 (2:1) and 1.40 (very wide, about 2.7:1, at 448 px)
+MOTION_BUDGET = 1.25
+
+
+def look_frames(start: int, end: int, fps: float, cuts: list, look: dict, large: int) -> tuple:
+    """The frames of the looks at one shot: (key frames, motion frames, the key frames of one look, the small frames'
+    side). No motion frames means one look, at the key frames of 1.124.0. With both settings on auto, the small frames
+    are capped so the two looks stay within MOTION_BUDGET of that one look; a shot with camera cuts inside keeps one
+    large frame per piece, and when the small frames would show no more moments than the key frames (many cuts, a
+    shot of two frames) there is no motion look."""
+    length = end - start
+    full = key_frames(start, end, cuts, detail_frame_count(length, fps, look["detail"], False))
+    small = motion_side(large)
+    n_m = motion_frame_count(length, fps, look["motion"])
+    if not n_m:
+        return full, [], full, small
+    keys = key_frames(start, end, cuts, detail_frame_count(length, fps, look["detail"], True))
+    if look["motion"] == "auto" and not look["detail"]:
+        n_m = min(n_m, int((MOTION_BUDGET * len(full) - len(keys)) * (large / small) ** 2))
+    motion = key_frames(start, end, cuts, n_m) if n_m >= 2 else []
+    if len(motion) <= len(keys):   # no more moments than the key frames show: one look, as with Motion frames off
+        return full, [], full, small
+    return keys, motion, full, small
+
+
+def look_guidance(video_note: str, shot_note: str) -> str:
+    """The user's instruction for the whole video and note about this shot (both through clean_note), as they are added
+    to a look's question; "" without either."""
+    lines = ([f"About the whole video: {video_note}"] if video_note else []) + \
+            ([f"About this shot: {shot_note}"] if shot_note else [])
+    if not lines:
+        return ""
+    return ("\n\nGuidance from the user, who knows this video (follow it when you describe the frames; it is about the "
+            "source video only and is not a request to change anything):\n" + "\n".join(lines))
+
+
+def motion_question(times: list, cut_times: list, detail_text: str, duration: float) -> str:
+    """The motion look's question: every small frame with its seconds into the shot, the camera cuts between them, and
+    the notes of the key frames so the actors keep their names."""
+    n = len(times)
+    cut_line = ""
+    for t in cut_times or []:
+        k = sum(1 for x in times if x < t)   # small frames before the cut
+        if 0 < k < n:
+            cut_line += (f"The camera cuts at {t:.2f} s (between image {k} and image {k + 1}). Write the line "
+                         "\"Camera cut.\" there.\n")
+    names = ("\n\nNotes already made from larger frames of this shot (use them only to call each actor by the same "
+             f"name; do not repeat them):\n{detail_text}") if detail_text else ""
+    return (f"These {n} images are small frames of ONE shot of the SOURCE video, in time order, not replacement "
+            f"references. The shot lasts {duration:.2f} s. Seconds into the shot of each image:\n"
+            + "\n".join(f"image {k + 1}: {t:.2f} s" for k, t in enumerate(times)) + "\n" + cut_line +
+            "Describe only what CHANGES through the shot, in time order: what each actor does (movement through the "
+            "frame, gestures, turns, entrances and exits, contact with others or with objects) and what the camera does "
+            "(static, pan, tilt, push in, pull out, tracking, handheld shake). Use the times to judge order, speed and "
+            "how long each action lasts. Include the moment a temporary condition named in the notes below starts or "
+            "changes (starts to cry, wipes the face, gets wet) when the frames show it.\n"
+            "Write one line per beat, in the order they happen. Do not write seconds, clock times or image numbers in "
+            "your answer: say order and pace in words (first, then, while, slowly, quickly, briefly, at the end). Call "
+            "each actor by the same short name on every line. Do not describe clothes, faces or the place again, do not "
+            "invent movement the frames do not support and do not infer sound. Do not assign any Picture reference: none "
+            "is shown here. Return only the lines, in English." + names)
+
+
+MOTION_TEXT_CAP = 6000   # characters of a motion answer that are read (its 768 tokens are about 3000)
+MOTION_LINE_CAP = 600    # a longer line is no beat: left out whole
+_UT_TIMEW = frozenset("s sec secs second seconds ms msec msecs millisecond milliseconds t".split())
+_UT_LABELW = frozenset("beat step part line segment moment action shot time image images img imgs frame frames "
+                       "picture pictures pic pics".split())
+_UT_JOINW = frozenset("to and about around approximately roughly the mark".split())
+_UT_GROUPW = _UT_TIMEW | _UT_LABELW | frozenset("at about around approx ca see".split())
+# beside a number, these make it a time or the number of a frame
+_UT_CLOCKW = frozenset("s sec secs second seconds ms msec msecs millisecond milliseconds min mins minute minutes mark "
+                       "frame frames image images img imgs picture pictures pic pics "
+                       "segundo segundos seconde secondes sekunde sekunden secondo secondi fotograma fotogramas".split())
+_UT_SPANW = _UT_CLOCKW - {"s", "mark"}
+_UT_FRAMEW = frozenset("frame frames image images img imgs picture pictures pic pics".split())
+_UT_NUMW = frozenset("one two three four five six seven eight nine ten eleven twelve fifteen twenty thirty half".split())
+_UT_ORDW = frozenset("third fourth fifth sixth seventh eighth ninth tenth".split())
+_UT_PREPW = frozenset("at after before around until till by from between near".split())
+_UT_FUNCW = frozenset("he she they it both the a an his her their and or to then when as while there".split())
+_UT_ABBR = ("sec.", "secs.", "min.", "approx.", "ca.", "fig.", "no.", "vs.", "e.g.", "i.e.")
+_UT_DELIM = ":.)]-–—→>|="
+_UT_EDGE = "()[]{}<>\"'“”‘’#"
+_UT_WORDS = re.compile(r"[^\W\d_]+")                       # one character class, one quantifier: linear
+_UT_GROUP = re.compile(r"[\[(]([^\[\]()\n]{0,60})[\])]")   # no nesting, a bounded class: linear
+_UT_NAME = re.compile(r"([A-Za-z]+)-?\d{1,2}")             # "P1", "Actor-2": a name, matched against one short token
+_UT_SPLIT = re.compile(r"(?<=[.!?])\s+")                   # a one-character lookbehind and \s+: linear
+_UT_TIDY = re.compile(r"\s+([,.;:!?])")                    # \s+ then one character: linear
+
+
+def _ut_lead(sentence: str) -> str:
+    """A sentence without the label or time in front of it: "[0.00-1.20 s] ...", "1.", "Beat 2:", "Image 3:",
+    "t=1.2s:", "0.12s -> 0.38s:", "At 1.2 s, ...". Only up to a delimiter, so "2 men enter" and "Image 1 shows ..."
+    stay whole; "" for a sentence that is nothing but a label or a time."""
+    chunks = sentence.split()
+    prep = bool(chunks) and chunks[0].lower() in _UT_PREPW
+    k, cut, digit, digit_at_cut = (1 if prep else 0), 0, False, False
+    while k < len(chunks):
+        c = chunks[k]
+        if not all(w in _UT_TIMEW or w in _UT_LABELW or (prep and w in _UT_JOINW)
+                   for w in (x.lower() for x in _UT_WORDS.findall(c))):
+            break
+        k += 1
+        digit = digit or any(ch.isdigit() for ch in c)
+        if c[-1] in (",:" if prep else _UT_DELIM):
+            cut, digit_at_cut = k, digit
+            if prep:
+                break
+    if digit and k == len(chunks):
+        return ""
+    return " ".join(chunks[cut:]) if cut and digit_at_cut else sentence
+
+
+def _ut_group(m) -> str:
+    """A bracket that holds a time or a frame number and nothing else goes: "(1.2 s)", "[0.00-1.20 s]", "(img 3)",
+    "(~1s)"; "(the woman)", "(1)" and "(see image 3 for the gesture)" stay."""
+    inner = m.group(1)
+    words = [w.lower() for w in _UT_WORDS.findall(inner)]
+    if not any(ch.isdigit() for ch in inner) or any(w not in _UT_GROUPW for w in words):
+        return m.group(0)
+    return m.group(0) if not words and inner.strip().isdigit() else " "
+
+
+def _ut_leak(sentence: str) -> bool:
+    """A sentence that names a numeric time or the number of a frame, image or picture, or holds a number that is
+    neither a plain count nor part of a name: it is left out whole."""
+    chunks = sentence.split()
+    digits = False
+    for i, c in enumerate(chunks):
+        if not any(ch.isdigit() for ch in c):
+            continue
+        digits = True
+        core = c.lstrip(_UT_EDGE).rstrip(_UT_EDGE + ".,;:!?")
+        for tail in ("'s", "\u2019s"):       # "Person 2's hand", "A1's arm": the name, not a time
+            if core.endswith(tail):
+                core = core[:-2]
+                break
+        if core.isascii() and core.isdigit():
+            prev = _UT_WORDS.findall(chunks[i - 1].lower())[-1:] if i else []
+            nxt = ""
+            if i + 1 < len(chunks) and c[-1] not in ".,;:!?":
+                word = chunks[i + 1].strip(_UT_EDGE + ".,;:!?").lower()
+                head = word.split("-")[0]
+                nxt = word if len(head) == 1 and "-" in word else "".join(_UT_WORDS.findall(head)[:1])
+            if nxt in _UT_CLOCKW or (prev and prev[0] in _UT_CLOCKW):
+                return True               # "2 seconds", "12 frames", "second 2", "picture 10"
+            if prev and prev[0] in _UT_PREPW and (not nxt or nxt in _UT_FUNCW):
+                return True               # "after 2 he waves", "at 3."
+            continue                      # a count or a name: "2 bottles", "claps 3 times", "Person 2"
+        name = _UT_NAME.fullmatch(core)
+        if not name or name.group(1).lower() in _UT_CLOCKW or name.group(1).lower() in _UT_TIMEW:
+            return True                   # "1.5", "0:04", "2-3", "3rd", "2s", ".5", "img3"
+    if digits and any(ord(ch) > 0x24F and ch.isalpha() for ch in sentence):
+        return True                       # a number in a sentence that is not in Latin letters: not readable here
+    words = [w.lower() for w in _UT_WORDS.findall(sentence)]
+    for i, w in enumerate(words):
+        if w in _UT_SPANW:
+            before, after = (words[i - 1] if i else ""), (words[i + 1] if i + 1 < len(words) else "")
+            if before in _UT_NUMW or before in _UT_ORDW or after in _UT_NUMW or (before == "second" and w in _UT_FRAMEW):
+                return True               # "two seconds", "the third second", "image seven", "the second image"
+    return False
+
+
+def _ut_sentences(line: str) -> list:
+    out = []
+    for part in _UT_SPLIT.split(line):
+        if out and out[-1].lower().endswith(_UT_ABBR):
+            out[-1] += " " + part         # "1.5 sec. in" is one sentence
+        else:
+            out.append(part)
+    return out
+
+
+def untimed(text, left_out: list | None = None, kept: list | None = None) -> str:
+    """The motion look's notes for the writer: the same beats in the same order. A label or time in front of a beat
+    and a bracket that holds only a time are removed; nothing else inside a sentence is touched. A sentence that still
+    names a numeric time or a frame / image / picture number, or holds a number that cannot be read as a plain count
+    or a name, is left out whole (added to `left_out` as the VLM wrote it); the sentences given to the writer are
+    added to `kept`. A line longer than MOTION_LINE_CAP is no beat: it is left out too (its first 80 characters). Headings (a line that ends with ':') and a table's header and rule go
+    without being counted. Digit-free pace words ("a second later", "in the last frames") stay as written."""
+    rows = []                             # [is a table row, sentences kept, sentences left out]
+    for raw in str(text or "")[:MOTION_TEXT_CAP].split("\n"):
+        line = raw.replace("*", "").replace("`", "").replace("#", "").strip()
+        if not line:
+            continue
+        if len(line) > MOTION_LINE_CAP:
+            rows.append([False, [], [line[:80] + "…"]])
+            continue
+        table = line.count("|") >= 2
+        if table and not line.strip("|-: \t"):   # a table's rule: the row above it is the header
+            if rows and rows[-1][0]:
+                rows.pop()
+            continue
+        if not table and line.endswith(":"):     # a heading, or a label with nothing after it
+            continue
+        good, gone = [], []
+        for cell in (line.split("|") if table else [line]):
+            for said in _ut_sentences(cell.strip()):
+                s = _UT_GROUP.sub(_ut_group, _ut_lead(said))
+                if _ut_leak(s):
+                    gone.append(" ".join(said.split()))   # as the VLM wrote it
+                    continue
+                s = _UT_TIDY.sub(r"\1", " ".join(s.split())).lstrip(" ,;:-–—•>")
+                if _UT_WORDS.search(s):
+                    good.append(s[0].upper() + s[1:] + ("." if table and s[-1] not in ".!?" else ""))
+        rows.append([table, good, gone])
+    for _, good, gone in rows:
+        if kept is not None:
+            kept.extend(good)
+        if left_out is not None:
+            left_out.extend(gone)
+    return "\n".join(" ".join(good) for _, good, _ in rows if good)
+
+
+def motion_usable(kept: list, left_out: list) -> bool:
+    """The motion answer is in the form asked for: something is kept, and more sentences are kept than left out."""
+    return bool(kept) and len(left_out) < len(kept)
+
+
+def source_notes(detail: str, motion: str, shot_note: str) -> str:
+    """What the writer is given about the source shot: the key frames' notes, the motion notes (already untimed) and
+    the user's note about the shot, each under a heading that says what it is. The key frames' notes alone are passed
+    as they are, as before 1.125.0."""
+    if not motion and not shot_note:
+        return detail
+    blocks = []
+    if shot_note:
+        blocks.append("FACTS FROM THE USER ABOUT THIS SOURCE SHOT (the user knows the video: these are true even where "
+                      "the notes below miss or contradict them. They describe the source performance: an action, a "
+                      "position or a temporary condition such as tears or sweat that they name is carried over to the "
+                      "subject that replaces that actor, as the rules say. They are not the request and not prompt text "
+                      "to copy):\n" + shot_note)
+    if detail:
+        blocks.append(("APPEARANCE, PLACE, LIGHT AND TEMPORARY CONDITIONS (from a few large frames):\n" if motion
+                       else "OBSERVED IN THE SOURCE FRAMES:\n") + detail)
+    if motion:
+        blocks.append("ACTIONS AND CAMERA IN TIME ORDER (from many small frames across the whole shot; one line per "
+                      "beat, first to last; a line 'Camera cut.' marks a cut. For what happens and in which order these "
+                      "lines win over the notes above; for looks, clothing, place, light and temporary conditions the "
+                      "notes above win. They carry no clock times: write none for them):\n" + motion)
+    return "\n\n".join(blocks)
+
+
 def shot_mode(seg: dict) -> str:
     """frame, paste, mask, crop or cropmask (the panel's names for a shot's mode)."""
     if seg.get("crop"):
@@ -2509,11 +2860,13 @@ def written_prompt_for(plan: dict, seg: dict, names: list, request: str, templat
 def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_texts: list, instruction: str,
                     seg: dict, source: str = "guide", duration: float = 0.0, max_tokens: int = 2048,
                     cuts: list | None = None, template: str = "", style: str = "h3", source_facts: str | None = None, prompt_trigger: str = "motion_transfer",
-                    keep_notes: list | None = None) -> str:
+                    keep_notes: list | None = None, carry_conditions: bool = False) -> str:
     """One shot's prompt in H3's full-reference format, written by the VLM from key frames of the shot ([1,H,W,3] each,
     at `times` seconds into it), the shot's reference pictures (<Picture 1> first) with their descriptions, the user's
     request and the shot's Colored Marks, selection and mode. keep_notes (the user's kept picture descriptions) are
-    added to the request once it is known whether the request is a whole template, so they never become template text."""
+    added to the request once it is known whether the request is a whole template, so they never become template text.
+    carry_conditions adds the rule that temporary conditions of the source performance (tears, sweat...) are carried
+    over to the replacing subject (AUTO_CONDITION_RULES); without it the writer is asked exactly as before 1.125.0."""
     nf, npics = len(frames), len(pictures)
     tt = ", ".join(_mmss(t) for t in times) if times else ""
     pics = ""
@@ -2606,6 +2959,9 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
         images = None
     else:
         images = _letterbox_batch(list(frames) + list(pictures))
+    if carry_conditions:
+        ask += ("\n\n" + AUTO_CONDITION_RULES + "\n"
+                + (AUTO_CONDITION_CAPTION if captions else AUTO_CONDITION_TEMPLATE if template else AUTO_CONDITION_H3))
     tokens = 512 if captions else max(1536, int(max_tokens))
     sampling = {"temperature": 0.6, "repetition_penalty": 1.1, "presence_penalty": 0.8}
     tidy = (lambda t: tidy_caption(t, seg, trigger)) if captions else \
@@ -2883,22 +3239,36 @@ def writable_shots(plan: dict, segs: list, indices=None) -> list:
 
 def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, names: list, pictures: list,
                      pic_details: dict, instruction: str, vcfg: dict, template: str = "") -> dict:
-    """Write one shot's prompt: {"text", "for", "seen"}: "for" is what it was made from (see auto_prompt_for), "seen"
-    what the VLM said about the source frames ({"text", "frames", "width", "height", "times"}: the answer, how many
-    frames of which size it was shown, and their seconds into the shot). "seen" is for the user to read: nothing
-    reads it back, so it never dates a prompt or changes a stored shot's signature."""
+    """Write one shot's prompt: {"text", "for", "seen", "look"}. "for" is what it was made from (auto_prompt_for).
+    "seen" is what the VLM said about the source: {"text", "frames", "width", "height", "times"} for the large key
+    frames (the answer, how many frames of which size, their seconds into the shot) and, when the motion look ran, the
+    same five keys under "motion" for the small frames (its answer as written), plus, only when they apply: "error"
+    (the look failed: its message), "left_out" (how many sentences were not given to the writer: see untimed), "unused" (True: the writer got none of the motion notes), "again" ("used", "empty" or "failed": the
+    key frames were then looked at again in full, and how that ended) and "again_error". "look" is what the looks
+    were made with (look_settings and the two notes as stored), for the panel's hint that they have changed. "seen"
+    and "look" are for the user to read: nothing reads them back, so they never date a prompt or change a stored
+    shot's signature."""
     ap = {**AUTO_PROMPT_DEFAULTS, **(plan.get("auto_prompt") or {})}
+    look = look_settings(plan)
+    video_note, shot_note = clean_note(look["instruction"]), clean_note(seg.get("look_note"))
     fps = float(analysis["fps"])
     L = seg["end"] - seg["start"]
-    n = auto_frame_count(L, fps, int(ap.get("frames") or 0))
     src = _timeline(analysis["n_src"], analysis["fps_src"], fps)
     cuts = [c for c in find_cuts(path, analysis, plan.get("detector", "adaptive"), float(plan.get("sensitivity", 0.5)))[0]
             if seg["start"] < c < seg["end"]]
-    picks = np.clip(np.array(key_frames(seg["start"], seg["end"], cuts, n)), 0, analysis["n"] - 1)
+    cut_times = [(c - seg["start"]) / fps for c in cuts]
     side = max(224, min(4096, int(vcfg.get("image_max_side") or 1024)))
-    sc = side / max(analysis["width"], analysis["height"])
-    size = (max(32, int(analysis["width"] * sc) // 2 * 2), max(32, int(analysis["height"] * sc) // 2 * 2))
-    frames = [torch.from_numpy(f.astype(np.float32) / 255.0)[None] for f in _read_frames(path, src[picks], size)]
+    side_d = look["side"] or side   # the large frames: Key frame size, else the VLM's Image max side
+    keys, motion_at, full, side_m = look_frames(seg["start"], seg["end"], fps, cuts, look, side_d)
+    picks = np.clip(np.array(keys), 0, analysis["n"] - 1)
+
+    def sized(longest: int) -> tuple:
+        sc = longest / max(analysis["width"], analysis["height"])
+        return max(32, int(analysis["width"] * sc) // 2 * 2), max(32, int(analysis["height"] * sc) // 2 * 2)
+
+    def read(at, longest: int) -> list:
+        return [torch.from_numpy(f.astype(np.float32) / 255.0)[None] for f in _read_frames(path, src[at], sized(longest))]
+    frames = read(picks, side_d)
     # Saved details can be stale or have been produced from a grouped reference batch: they are read only for a
     # picture with *use my description* on. The writer gets the isolated evidence of every picture; a {details} in the
     # template or the request gets that picture described alone for its sentence with the user's describe settings,
@@ -2916,36 +3286,99 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
             keep_lines.append(f"<Picture {k + 1}> is described by the user as: {said}{end} Keep all of these details "
                               f"for <Picture {k + 1}>; they override any other description of it.")
     tmpl = fresh_picture_details(clip, template, names, pictures, plan, vcfg, tag)
-    source_question = ("These images are ONLY chronological frames of the SOURCE video, not replacement "
-                       "references. Describe the visible actors separately, their apparent gender when clear, "
-                       "distinctive source clothing, initial positions, actions and interactions through the frames. "
-                       "Keep each actor identifiable as positions change. Describe the observed setting, medium, "
-                       "lighting and camera. Do not invent unseen movements or infer sound from silent frames. "
-                       "Do not assign any Picture reference: none is shown here. Return concise English observations.")
-    # the frames as read (the VLM's Image max side, the shot's own aspect), as vlm_shot sends them: this look is all
-    # the writer knows about the video, and a 448 px letterbox loses small faces, hands and people in the background
-    source_facts = str(vlm_generate(clip, source_question, torch.cat(frames, 0), 1024) or "").strip()
+
+    def say(line: str) -> None:
+        try:
+            print(line, flush=True)
+        except (UnicodeError, OSError):   # a console that cannot print the model's text must not fail the write:
+            try:                          # it gets the notes with those characters escaped
+                print(line.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
+            except (UnicodeError, OSError):
+                pass
+    guide = look_guidance(video_note, shot_note)
+    # the large frames as read (their own aspect, no letterbox), as vlm_shot sends them: who, clothes, place, light and
+    # the temporary conditions of the performance (tears, sweat...)
+    source_facts = str(vlm_generate(clip, SOURCE_QUESTION + guide, torch.cat(frames, 0), 1024) or "").strip()
     times = [(int(x) - seg["start"]) / fps for x in picks]
     # kept with the written prompt and shown under it in the panel: a bad prompt can be told apart from a bad look
     seen = {"text": source_facts, "frames": len(frames), "width": int(frames[0].shape[2]),
             "height": int(frames[0].shape[1]), "times": [round(t, 2) for t in times]}
-    said = (f"{tag}: the VLM saw in the source ({seen['frames']} key frame{'' if seen['frames'] == 1 else 's'} at "
-            f"{seen['width']}x{seen['height']}): "
-            f"{source_facts or 'nothing (an empty answer): the writer has no description of the video'}")
-    try:
-        print(said, flush=True)
-    except (UnicodeError, OSError):   # a console that cannot print the model's text must not fail the write:
-        try:                          # it gets the notes with those characters escaped
-            print(said.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
-        except (UnicodeError, OSError):
-            pass
+    say(f"{tag}: the VLM saw in the source ({seen['frames']} key frame{'' if seen['frames'] == 1 else 's'} at "
+        f"{seen['width']}x{seen['height']}): "
+        f"{source_facts or 'nothing (an empty answer): the writer has no description of the video'}")
+    motion_notes = ""
+    if motion_at:
+        # many small frames across the whole shot, each with its time: what happens, in which order, and the camera
+        picks_m = np.clip(np.array(motion_at), 0, analysis["n"] - 1)
+        times_m = [(int(x) - seg["start"]) / fps for x in picks_m]
+        question = motion_question(times_m, cut_times, source_facts, L / fps) + guide
+        motion = seen["motion"] = {"text": "", "frames": 0, "width": 0, "height": 0, "times": []}
+        _status("Looking at the shot's motion with the VLM", force=True)
+        try:   # only the small frames' read and their VLM call: a failure costs the shot its motion look, not its prompt
+            frames_m = read(picks_m, side_m)
+            motion.update(frames=len(frames_m), width=int(frames_m[0].shape[2]), height=int(frames_m[0].shape[1]),
+                          times=[round(t, 2) for t in times_m])
+            motion["text"] = str(vlm_generate(clip, question, torch.cat(frames_m, 0), 768) or "").strip()
+        except Exception as exc:   # noqa: BLE001 - said in the console and kept with the prompt (seen.motion.error)
+            if type(exc).__name__ == "InterruptProcessingException":   # Cancel stops the write, as everywhere else
+                raise
+            motion["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        left_out, beats = [], []
+        notes = untimed(motion["text"], left_out, beats)   # for the writer: in order, no numeric time or image number
+        say(f"{tag}: the VLM saw the motion in the source ({motion['frames']} frames at "
+            f"{motion['width']}x{motion['height']}): "
+            + (motion["text"] or (f"nothing: the look failed ({motion['error']})" if motion.get("error")
+                                  else "nothing (an empty answer): the writer has only the key-frame notes")))
+        if left_out:
+            motion["left_out"] = len(left_out)
+            say(f"{tag}: {len(left_out)} sentence(s) of the motion notes were left out for the writer (a time, a frame "
+                "number, a number that is not plainly a count, or a line too long to be one beat): " + " | ".join(left_out))
+        if motion_usable(beats, left_out):
+            motion_notes = notes
+        else:
+            # nothing usable from the small frames: the writer gets none of it, and the shot says so
+            motion["unused"] = True
+            why = ("gave the writer nothing" if not beats else
+                   "is not in the form asked for (as many sentences left out as kept, or more)")
+            if len(full) > len(keys):   # a look at all the key frames shows more than the first look did
+                say(f"{tag}: WARNING the motion look {why}: looking again at {len(full)} key frames, "
+                    "as with Motion frames off")
+                picks_f = np.clip(np.array(full), 0, analysis["n"] - 1)
+                try:   # as optional as the motion look: the first look's notes are in hand
+                    frames_f = read(picks_f, side_d)
+                    again = str(vlm_generate(clip, SOURCE_QUESTION + guide, torch.cat(frames_f, 0), 1024) or "").strip()
+                except Exception as exc:   # noqa: BLE001 - said in the console and kept (seen.motion.again_error)
+                    if type(exc).__name__ == "InterruptProcessingException":   # Cancel stops the write
+                        raise
+                    motion["again"], motion["again_error"] = "failed", f"{type(exc).__name__}: {exc}"[:300]
+                    say(f"{tag}: WARNING that look failed ({motion['again_error']}): the prompt is written from "
+                        f"the first {len(frames)} key frames")
+                else:
+                    if again:
+                        motion["again"] = "used"
+                        picks, frames, source_facts = picks_f, frames_f, again
+                        times = [(int(x) - seg["start"]) / fps for x in picks]
+                        seen.update(text=again, frames=len(frames), width=int(frames[0].shape[2]),
+                                    height=int(frames[0].shape[1]), times=[round(t, 2) for t in times])
+                        say(f"{tag}: the VLM saw in the source ({seen['frames']} key frames at "
+                            f"{seen['width']}x{seen['height']}): {again}")
+                    else:
+                        motion["again"] = "empty"
+                        say(f"{tag}: WARNING that look answered nothing: the prompt is written from the first "
+                            f"{len(frames)} key frames")
+            else:
+                say(f"{tag}: WARNING the motion look {why}: the prompt is written from the {len(frames)} key frames alone")
+    if video_note or shot_note:
+        say(f"{tag}: your notes for the looks: video: {video_note!r}; shot: {shot_note!r}")
     _status("Writing the shot's prompt with the VLM", force=True)
     text = write_h3_prompt(clip, frames, times, pictures,
                            picture_evidence, request, seg, ap.get("source") or "guide", L / fps,
-                           int(vcfg.get("max_tokens") or 1024), [(c - seg["start"]) / fps for c in cuts], tmpl,
-                           ap.get("style") or "h3", source_facts=source_facts, prompt_trigger=ap["trigger"],
-                           keep_notes=keep_lines)
-    return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template), "seen": seen}
+                           int(vcfg.get("max_tokens") or 1024), cut_times, tmpl,
+                           ap.get("style") or "h3", source_facts=source_notes(source_facts, motion_notes, shot_note),
+                           prompt_trigger=ap["trigger"], keep_notes=keep_lines, carry_conditions=True)
+    return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template), "seen": seen,
+            "look": {"motion": str(look["motion"]), "detail": look["detail"], "side": look["side"],
+                     "video": look["instruction"], "shot": str(seg.get("look_note") or "")}}
 
 
 PLACE_Q = ("This picture shows a place; the patch of black-and-white noise only hides a person, ignore it. Describe the "
@@ -3504,8 +3937,10 @@ def run_dir(run_id: str, create: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------- shot cache (signatures, redo)
+# look_note (the note for Auto prompt's looks at the source) only changes prompts written later: a stored shot counts
+# its written prompt's text, never the note
 _SIG_SKIP = ("stats", "people", "main", "cast_skip", "skip_reason", "run", "enabled", "force", "refs",
-             "color_guide_marks")
+             "color_guide_marks", "look_note")
 _SIG_PLAN = ("grid", "fps", "megapixels", "generation_size_mode", "custom_width", "custom_height", "multiple",
              "global_prompt", "global_ref", "global_ref2", "global_color_guide_ref1", "global_color_guide_ref2",
              "mask_cfg", "vlm_cfg", "ref_details", "audio_mode", "mask_video")
@@ -6450,7 +6885,7 @@ try:
     @PromptServer.instance.routes.post("/bfs/shotloop/autoprompt")
     async def _bfs_shot_autoprompt(request):
         """🤖 Auto prompt: the VLM writes the H3 prompt of some shots: body {plan, indices} -> {prompts: {"start-end":
-        {text, for, seen}}}. Locked shots ('use my prompt') are left out."""
+        {text, for, seen, look}}}. Locked shots ('use my prompt') are left out."""
         body = await request.json()
 
         def work():

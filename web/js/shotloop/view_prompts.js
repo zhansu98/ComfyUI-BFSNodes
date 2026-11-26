@@ -119,6 +119,10 @@ function autoSection(c) {
   const S = segs.value, missing = S.filter(s => !c.writtenOf(s)?.text).length;
   const locked = S.filter(s => c.lockedOf(s)).length;
   const stale = S.filter(s => !c.lockedOf(s) && c.writtenOf(s)?.text && c.writtenOf(s).for !== c.autoFor(s)).length;
+  const L = plan.auto_look || {};
+  // written with other look settings or notes: a soft hint, these prompts are not "older" and no run rewrites them
+  const relook = S.filter(s => !c.lockedOf(s) && c.writtenOf(s)?.text && c.lookChangedOf(s)).length;
+  const failed = S.filter(s => !c.lockedOf(s) && c.writtenOf(s)?.text && c.motionFailedOf(s)).length;
   return section("🤖 Auto prompt (H3)", [
     h("div", { class: "row", style: "gap:12px;align-items:center" }, [
       check(A.enabled, v => c.setAuto("enabled", v), "Write the prompts with the VLM",
@@ -127,8 +131,13 @@ function autoSection(c) {
         v => c.setAuto("style", v), { style: "width:auto" }), "Choose prompt format. The guide performance stays fixed; request style, setting, lighting, outfit or camera changes explicitly. Identify setting pictures in the request; bind colors only to character references."),
       fld("Trigger", select(A.trigger ?? "motion_transfer", [["motion_transfer", "motion_transfer:"], ["body_swap", "body_swap:"], ["", "None (plain prompt)"]],
         v => c.setAuto("trigger", v), { style: "width:auto" }), "Match the LoRA caption prefix. Choose None for a model trained without a trigger."),
-      fld("Key frames", select(String(A.frames || 0), [["0", "auto (by length)"], ...[3, 4, 5, 6, 8, 10, 12].map(n => [String(n), String(n)])],
-        v => c.setAuto("frames", parseInt(v) || 0), { style: "width:auto" }), "auto: about 1.5 per second, 3 to 8"),
+      // the looks at the source: plan.auto_look, which no stored shot's signature reads (auto_prompt is hashed whole)
+      fld("Key frames", select(String(L.detail ?? A.frames ?? 0), [["0", "auto (by length)"], ...[2, 3, 4, 5, 6, 8, 10, 12].map(n => [String(n), String(n)])],
+        v => c.setLook("detail", parseInt(v) || 0), { style: "width:auto" }), "large frames for who, clothes, faces and place · auto: 2 to 4 with the motion look, 3 to 8 without (the cost of before) · a number is used as it is and the motion look comes on top"),
+      fld("Motion frames", select(String(L.motion ?? "auto"), [["auto", "auto (about 4 per second, up to 24)"], ["off", "off (one look)"], ...[8, 12, 16, 24, 32].map(n => [String(n), String(n)])],
+        v => c.setLook("motion", v), { style: "width:auto" }), "small frames (half the key frames' size, 224 to 448 px) with their times, for actions and camera"),
+      fld("Key frame size", select(String(L.side || 0), [["0", "as Image max side (VLM)"], ...[448, 672, 896, 1024, 1280, 1536, 2048].map(n => [String(n), `${n} px`])],
+        v => c.setLook("side", parseInt(v) || 0), { style: "width:auto" }), "the key frames' size alone: larger shows small things on faces (tears, sweat) in wide shots and costs more VLM time and memory, smaller costs less"),
       fld("Source video in the prompt", select(A.source || "guide", [["guide", "guide video (aligned guide)"], ["video", "<Video 1> (native reference video)"]],
         v => c.setAuto("source", v), { style: "width:auto" }), "match the conditioning node's guide_mode"),
       h("button", { class: "pri", disabled: !!busy.value || !S.length || locked === S.length,
@@ -136,9 +145,13 @@ function autoSection(c) {
       h("button", { disabled: !!busy.value || !missing, onClick: () => c.writePrompts(S.map((s, i) => (c.writtenOf(s)?.text ? -1 : i)).filter(i => i >= 0)) },
         `only the missing (${missing})`),
     ]),
+    h("textarea", { maxlength: 600, style: "margin-top:6px;min-height:40px", value: L.instruction || "",
+      placeholder: "Instruction for the VLM's looks at the source, for every shot (optional), e.g. 'this is a dance video: name each move' or 'ignore the crowd in the background'",
+      onChange: e => c.setLook("instruction", e.target.value) }),
+    hint("Read by both looks at every shot (not by the prompt writer). Key frames, Motion frames, Key frame size and this instruction never re-render a stored shot and never mark a prompt older: they apply to prompts written after the change (🤖 Write again). Each shot has its own note box above its written prompt (Shots tab).", "display:block;margin-top:3px"),
     A.enabled && A.template ? h("div", { class: "hint", style: "display:block;margin-top:4px", title: A.template },
       `Template (the node's prompt input, last run): ${A.template.slice(0, 110)}${A.template.length > 110 ? "…" : ""} · the prompt boxes are the request applied to it`) : null,
-    hint(A.enabled ? `${S.length - missing}/${S.length} shots have a written prompt${stale ? ` · ${stale} older than their request, pictures or marks` : ""}${locked ? ` · ${locked} 🔒 yours ('use my prompt', never rewritten)` : ""} · shots without one are written when the workflow runs (with the VLM on the planner) · edit them in each shot (Shots tab)`
+    hint(A.enabled ? `${S.length - missing}/${S.length} shots have a written prompt${stale ? ` · ${stale} older than their request, pictures or marks` : ""}${locked ? ` · ${locked} 🔒 yours ('use my prompt', never rewritten)` : ""}${relook ? ` · ${relook} written with other look settings or notes` : ""}${failed ? ` · ${failed} written without the motion look (it gave nothing)` : ""} · shots without one are written when the workflow runs (with the VLM on the planner) · edit them in each shot (Shots tab)`
       : "Off: the prompt boxes are the prompts.", "display:block;margin-top:4px"),
   ], { sub: "request + video + pictures -> MiniMax H3 prompt", right: A.enabled ? pill("on", "ok") : pill("off") });
 }

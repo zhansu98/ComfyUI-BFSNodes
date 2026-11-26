@@ -111,6 +111,10 @@ function editor(c, cur) {
       const w = c.writtenOf(cur), lockOn = w?.lock === true, locked = !!c.lockedOf(cur);
       const old = !locked && w?.text && w.for !== c.autoFor(cur);
       const look = c.seenOf(cur);
+      // the notes the looks were made with (kept with the written prompt), in your words
+      const made = w?.look && typeof w.look === "object" ? w.look : {};
+      const usedNotes = [typeof made.video === "string" && made.video.trim() ? `every shot: ${made.video.trim()}` : "",
+                         typeof made.shot === "string" && made.shot.trim() ? `this shot: ${made.shot.trim()}` : ""].filter(Boolean).join("\n");
       return h("div", { class: "note", style: "margin-top:6px;padding:6px 8px" }, [
         h("div", { class: "row", style: "gap:6px;align-items:center;margin-bottom:4px" }, [
           h("b", "🤖 Written prompt"), old ? pill("older than the request / pictures / marks", "warn") : null,
@@ -125,22 +129,50 @@ function editor(c, cur) {
             onClick: () => c.setWritten(cur, "") }, "✕") : null,
         ]),
         lockOn && !locked ? hint("No prompt to keep yet: type it below (until then the switch does nothing).", "display:block;margin-bottom:3px") : null,
+        // your note about this shot's source: read by both looks, and given to the prompt writer as a fact
+        h("input", { type: "text", maxlength: 600, style: "width:100%;margin-bottom:4px;font-size:11px", value: cur.look_note,
+          placeholder: "What happens in this shot's source that the VLM may miss (optional), e.g. 'tears on both cheeks from the start; he enters from the right at the end'",
+          title: "Facts about this shot's source, not instructions: they go to both looks and to the prompt writer as facts about the source performance. Say when with words (at the start, then, at the end), not seconds: a time typed here can end up in the prompt. How the VLM should look (e.g. 'ignore the crowd') goes in the instruction in Prompts & refs. The note stays with the shot's number: after Auto split, a Range change or a cut you move, check it. Used the next time this shot's prompt is written; it never re-renders the stored shot or marks the prompt older.",
+          onChange: e => c.setLookNote(i, e.target.value) }),
+        // the note stays with the shot's number: say so when that number now covers other frames
+        cur.look_note && cur.look_note_for && cur.look_note_for !== segKey(cur)
+          ? h("span", { class: "hint", style: "display:block;margin-bottom:3px;color:#ffc46b" },
+              `⚠ This note was typed when this shot covered other frames (${cur.look_note_for}). Check that it still fits; editing it confirms it.`) : null,
+        !locked && w?.text && c.lookChangedOf(cur)
+          ? hint("ℹ look settings or notes changed since this prompt was written · 🤖 Write again to use them", "display:block;margin-bottom:3px") : null,
         h("textarea", { style: "min-height:140px;font-size:11px", value: w?.text || "",
           placeholder: lockOn ? "your prompt for this shot (sent as written; {details} {target} still filled)"
             : "not written yet: 🤖 Write, or the planner's VLM writes it when the workflow runs",
           onChange: e => c.setWritten(cur, e.target.value) }),
+        // outside the collapsed block: the motion look gave the writer nothing, and what the prompt was written from
+        !locked && w?.text && c.motionSaidOf(cur)
+          ? h("span", { class: "hint", style: "display:block;margin-top:3px;color:#ffc46b" }, c.motionSaidOf(cur)) : null,
         // what the VLM said about the source frames when it last wrote this shot: all the writer knew of the video
         look ? h("details", { style: "margin-top:4px" }, [
           h("summary", { class: "hint", style: "cursor:pointer" },
-            `👁 What the VLM saw in the source${look.frames ? ` · ${look.frames} key frame${look.frames === 1 ? "" : "s"}${look.width && look.height ? ` at ${look.width}×${look.height} px` : ""}` : ""}${look.text.trim() ? "" : " · nothing"}`),
-          hint(`From the last time the VLM wrote this shot's prompt${look.times.length ? ` (frames at ${look.times.map(x => `${x.toFixed(2)} s`).join(", ")} into the shot)` : ""}. `
+            `👁 What the VLM saw in the source${look.frames ? ` · ${look.frames} key frame${look.frames === 1 ? "" : "s"}${look.width && look.height ? ` at ${look.width}×${look.height} px` : ""}` : ""}${look.text.trim() ? "" : " · nothing"}`
+            + (look.motion ? ` · motion: ${look.motion.frames} frame${look.motion.frames === 1 ? "" : "s"}${look.motion.width && look.motion.height ? ` at ${look.motion.width}×${look.motion.height} px` : ""}${look.motion.text.trim() ? "" : " · nothing"}` : "")),
+          hint(`From the last time the VLM wrote this shot's prompt${look.times.length ? ` (key frames at ${look.times.map(x => `${x.toFixed(2)} s`).join(", ")} into the shot)` : ""}. `
             + (locked ? "The shot now uses your own prompt ('use my prompt'), so these notes no longer feed it."
-              : "It reads these frames alone, without your request or the pictures, and the prompt writer never sees the video, only this text: what is missing or wrong here is missing or wrong in the prompt. To fix this shot only, edit the prompt above and tick 'use my prompt'. A larger Image max side (VLM) or more Key frames (Prompts & refs) give the look more to see, but changing either re-renders every stored shot."),
+              : "The VLM reads the source frames alone, without your request or the pictures, and the prompt writer never sees the video, only these notes: what is missing or wrong here is missing or wrong in the prompt. Tell the VLM what it misses in the box above (this shot) or in the instruction in Prompts & refs (every shot), or raise Key frames, Motion frames or Key frame size there, then 🤖 Write again: none of these re-renders another stored shot. Only Image max side (VLM) does."),
             "display:block;margin:3px 0"),
-          // rawH = Vue's h without the panel's translation: the VLM's words go in as a text node, as they are
+          // rawH = Vue's h without the panel's translation: the VLM's words and yours go in as text nodes, as they are
           look.text.trim()
             ? rawH("div", { style: "white-space:pre-wrap;font-size:11px;max-height:220px;overflow:auto;padding:5px 7px;border:1px solid #2b3557;border-radius:5px;user-select:text" }, look.text)
-            : hint("The VLM answered nothing for these frames, so the writer had no description of the video. Fewer Key frames or a smaller Image max side (VLM) may help (changing either re-renders every stored shot); or write this shot's prompt yourself with 'use my prompt'.", "display:block"),
+            : hint("The VLM answered nothing for the key frames, so the writer had no description of who and what is in the video. Fewer Key frames or a smaller Key frame size may help (Prompts & refs); or say it in the box above, or write this shot's prompt yourself with 'use my prompt'.", "display:block"),
+          look.motion ? hint(`Motion, from ${look.motion.frames} small frames${look.motion.times.length ? ` between ${look.motion.times[0].toFixed(2)} s and ${look.motion.times[look.motion.times.length - 1].toFixed(2)} s` : ""}, each given to the VLM with its time. It is asked to answer in order, without times; the writer gets these lines with no numeric time and no frame, image or picture number (a label or time in front of a line is removed, and a sentence that still names one is left out whole).`,
+            "display:block;margin:5px 0 3px") : null,
+          look.motion?.error ? hint("The motion look failed with this error, so the shot was written without it:", "display:block;margin-bottom:3px;color:#ffc46b") : null,
+          look.motion?.error ? rawH("div", { style: "white-space:pre-wrap;font-size:11px;padding:5px 7px;border:1px solid #6b4b1f;border-radius:5px;user-select:text" }, look.motion.error) : null,
+          look.motion && !look.motion.error ? (look.motion.text.trim()
+            ? rawH("div", { style: "white-space:pre-wrap;font-size:11px;max-height:220px;overflow:auto;padding:5px 7px;border:1px solid #2b3557;border-radius:5px;user-select:text" }, look.motion.text)
+            : hint("The VLM answered nothing for the small frames. Fewer Motion frames may help (Prompts & refs).", "display:block")) : null,
+          look.motion?.left_out ? hint(`${look.motion.left_out} sentence(s) were left out for the writer: they name a time or a frame number, hold a number that is not plainly a count, or are a line too long to be one beat.`, "display:block;margin-top:3px") : null,
+          look.motion?.unused ? hint("The writer got none of the motion notes (nothing usable, or as many sentences left out as kept).", "display:block;margin-top:3px") : null,
+          look.motion?.again_error ? hint("The second look at the key frames failed with this error:", "display:block;margin:3px 0;color:#ffc46b") : null,
+          look.motion?.again_error ? rawH("div", { style: "white-space:pre-wrap;font-size:11px;padding:5px 7px;border:1px solid #6b4b1f;border-radius:5px;user-select:text" }, look.motion.again_error) : null,
+          usedNotes ? hint("Your notes that these looks were made with:", "display:block;margin:5px 0 3px") : null,
+          usedNotes ? rawH("div", { style: "white-space:pre-wrap;font-size:11px;padding:5px 7px;border:1px solid #2b3557;border-radius:5px;user-select:text" }, usedNotes) : null,
         ]) : null,
       ]);
     })() : null,
