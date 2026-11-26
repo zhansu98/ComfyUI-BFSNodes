@@ -2843,12 +2843,13 @@ class PanelRoutesHttpTest(unittest.TestCase):
         segs = [{"start": 0, "end": 10, "refs": [], "prompt": "p"}]
         with patch.object(M, "analyze", lambda path, fps: {}), patch.object(M, "resolve_plan", lambda p, a, path: segs), \
              patch.object(M, "panel_vlm", lambda source=None, required=True: "clip"), \
-             patch.object(M, "auto_prompt_shot", lambda *a, **k: {"text": "written", "for": "x"}):
+             patch.object(M, "auto_prompt_shot", lambda *a, **k: {"text": "written", "for": "x", "seen": {"text": "A man."}}):
             async def go(s, base):
                 r = await s.post(f"{base}/bfs/shotloop/autoprompt", json={"plan": {"video": "http.mp4"}, "indices": [0]})
                 return r.status, await self._follow(s, base, r)
             status, out = self._serve(go)
-        self.assertEqual((status, out), (200, {"prompts": {"0-10": {"text": "written", "for": "x"}}}))
+        # the writer's whole answer, with what the VLM saw in the source ("seen")
+        self.assertEqual((status, out), (200, {"prompts": {"0-10": {"text": "written", "for": "x", "seen": {"text": "A man."}}}}))
 
     def test_auto_prompt_leaves_locked_shots_alone(self):
         M = self.M
@@ -3058,3 +3059,143 @@ class UseMyPromptTest(unittest.TestCase):
         self.assertEqual(locks, want)
         self.assertEqual(merged, {"a": {"text": "mine", "lock": True}, "b": {"text": "vlm"}, "c": {"text": "vlm"},
                                   "d": {"text": "vlm"}})   # a shot locked meanwhile keeps its prompt
+
+
+class SourceLookTest(unittest.TestCase):
+    """🤖 Auto prompt: what the VLM says it sees in the shot's source frames is all the prompt writer knows about the
+    video. It is read from frames at the VLM's Image max side and kept with the written prompt ("seen")."""
+
+    ANALYSIS = {"fps": 24.0, "fps_src": 24.0, "n_src": 48, "n": 48, "width": 1920, "height": 1080}
+    SEG = {"start": 0, "end": 24, "prompt": ""}
+
+    def _write(self, vcfg, answer="A man gives two thumbs up.", plan=None):
+        import contextlib
+        import io
+        looks, wrote, printed = [], [], io.StringIO()
+
+        def generate(clip, prompt, images, max_tokens, *args, **kwargs):
+            looks.append((prompt, images))
+            return answer
+        with patch.object(SL, "find_cuts", return_value=([], "none")), \
+                patch.object(SL, "_read_frames", side_effect=lambda path, idx, size, stage=None:
+                             [np.full((size[1], size[0], 3), int(i), np.uint8) for i in idx]), \
+                patch.object(SL, "_status"), patch.object(SL, "vlm_generate", side_effect=generate), \
+                patch.object(SL, "vlm_describe", return_value="evidence"), \
+                patch.object(SL, "write_h3_prompt", side_effect=lambda *a, **k: wrote.append({**k, "args": a}) or "ok"), \
+                contextlib.redirect_stdout(printed):
+            out = SL.auto_prompt_shot(object(), plan or {}, self.ANALYSIS, "x.mp4", dict(self.SEG), ["a.png"],
+                                      [torch.zeros(1, 4, 4, 3)], {}, "Swap.", SL.vlm_cfg(vcfg))
+        return out, looks, wrote, printed.getvalue()
+
+    def test_source_frames_reach_the_vlm_at_image_max_side(self):
+        for side, shape in ((896, (3, 504, 896, 3)), (448, (3, 252, 448, 3)), (None, (3, 576, 1024, 3))):
+            _, looks, _, _ = self._write({"image_max_side": side})
+            self.assertEqual(len(looks), 1)   # one look at the source, frames only
+            self.assertEqual(tuple(looks[0][1].shape), shape)   # not a 448 px square with grey bars
+            self.assertEqual(looks[0][1].dtype, torch.float32)
+            # in time order, as the question says (each frame holds its place on the timeline: 4, 12, 20)
+            self.assertEqual([round(float(v) * 255) for v in looks[0][1][:, 0, 0, 0]], [4, 12, 20])
+
+    def test_what_the_vlm_saw_is_kept_with_the_prompt_and_printed(self):
+        out, _, wrote, printed = self._write({"image_max_side": 896})
+        self.assertEqual(out["text"], "ok")
+        self.assertEqual(out["seen"], {"text": "A man gives two thumbs up.", "frames": 3, "width": 896, "height": 504,
+                                       "times": [0.17, 0.5, 0.83]})
+        self.assertEqual(wrote[0]["source_facts"], out["seen"]["text"])   # the writer gets the same text
+        self.assertEqual(wrote[0]["args"][2], [4 / 24, 12 / 24, 20 / 24])   # and the exact times, as before
+        self.assertIn("shot 0-24", printed)
+        self.assertIn("3 key frames at 896x504", printed)
+        self.assertIn("A man gives two thumbs up.", printed)
+
+    def test_an_empty_look_is_kept_as_empty_and_said(self):
+        for answer in ("", "  \n", None):
+            out, _, wrote, printed = self._write({}, answer=answer)
+            self.assertEqual(out["seen"]["text"], "")
+            self.assertEqual(wrote[0]["source_facts"], "")   # still the text-only writer (not None)
+            self.assertIn("nothing", printed)
+
+    def test_a_console_that_cannot_print_the_look_does_not_fail_the_write(self):
+        import builtins
+        said = "一个男人竖起两个大拇指。"
+
+        lines = []
+
+        def narrow(*args, **kwargs):   # a cp1252 / ASCII console
+            for x in args:
+                str(x).encode("ascii")
+            lines.extend(str(x) for x in args)
+        with patch.object(builtins, "print", narrow):
+            out, _, wrote, _ = self._write({}, answer=said)
+        self.assertEqual(out["seen"]["text"], said)
+        self.assertEqual(wrote[0]["source_facts"], said)
+        # the console still gets the notes, with the characters it cannot print escaped
+        self.assertTrue(any("the VLM saw in the source" in x and "\\u4e00\\u4e2a" in x for x in lines), lines)
+
+    def test_the_settings_the_hint_names_rerender_every_stored_shot(self):
+        # the panel hint and the docs say so: Image max side (VLM) and Key frames are part of each stored shot's
+        # signature (a change re-renders it), yet neither dates a written prompt (it has to be written again by hand)
+        seg = {"start": 0, "end": 24, "prompt": "Swap."}
+        base = {**SL.DEFAULT_PLAN, "auto_prompt": {"enabled": True}, "global_refs": ["a.png"]}
+        side = {**base, "vlm_cfg": {"image_max_side": 448}}
+        keys = {**base, "auto_prompt": {"enabled": True, "frames": 8}}
+        for changed in (side, keys):
+            self.assertNotEqual(SL.shot_signature(base, seg, 0, {}), SL.shot_signature(changed, seg, 0, {}))
+            self.assertEqual(SL.written_prompt_for(base, seg, ["a.png"], "Swap."),
+                             SL.written_prompt_for(changed, seg, ["a.png"], "Swap."))
+
+    def test_the_shot_editor_shows_it_untranslated(self):
+        # the views read the panel's context object: a name missing there throws when the Shots tab is drawn
+        src = (ROOT / "web/js/bfs_shot_loop.js").read_text(encoding="utf-8")
+        self.assertRegex(src[src.rindex("  const c = {"):].split("};")[0], r"\bseenOf\b")
+        view = (ROOT / "web/js/shotloop/view_shots.js").read_text(encoding="utf-8")
+        self.assertIn("const look = c.seenOf(cur);", view)
+        self.assertRegex(view, r'rawH\("div", \{[^}]*\}, look\.text\)')   # the VLM's words: a text node, never t()
+        self.assertNotRegex(view, r"innerHTML|v-html")
+
+    def test_what_the_vlm_saw_never_dates_or_rerenders_a_shot(self):
+        seg = {"start": 0, "end": 24, "prompt": "Swap."}
+        stamp = SL.written_prompt_for({}, seg, ["a.png"], "Swap.")
+        bare = {"auto_prompts": {"0-24": {"text": "written", "for": stamp}}}
+        seen = {"auto_prompts": {"0-24": {"text": "written", "for": stamp, "seen": {"text": "A man.", "frames": 3}}}}
+        self.assertEqual(SL.stored_written_prompt(bare, seg, ["a.png"], "Swap."), ("current", "written"))
+        self.assertEqual(SL.stored_written_prompt(seen, seg, ["a.png"], "Swap."), ("current", "written"))
+        for lock in ({}, {"lock": True}):   # the stored shot's signature: with Auto prompt on, locked or not
+            on = [{**SL.DEFAULT_PLAN, "auto_prompt": {"enabled": True}, "global_refs": ["a.png"],
+                   "auto_prompts": {"0-24": {**p["auto_prompts"]["0-24"], **lock}}} for p in (bare, seen)]
+            self.assertEqual(SL.shot_signature(on[0], seg, 0, {}), SL.shot_signature(on[1], seg, 0, {}))
+
+    def test_browser_reads_and_forgets_what_the_vlm_saw(self):
+        import json
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        src = (ROOT / "web/js/bfs_shot_loop.js").read_text(encoding="utf-8")
+        helper = src[src.index("function sourceLook"):src.index("const viewUrl")]
+        setter = src[src.index("const setWritten ="):src.index("const setLock =")]
+        entries = [{"text": "p", "seen": {"text": "A man.", "frames": 3, "width": 896, "height": 504, "times": [0.17, 0.5]}},
+                   {"text": "p", "seen": {"text": ""}}, {"text": "p", "seen": {"text": "x", "frames": "3", "times": "no"}},
+                   {"text": "p", "seen": {"text": "x", "frames": -1, "width": None, "times": [0.5, "a", None]}},
+                   {"text": "p", "seen": "A man."}, {"text": "p", "seen": {"text": 5}}, {"text": "p", "seen": None},
+                   {"text": "p"}, "x", None, []]
+        script = (helper + "\nlet plan; const segKey = s => s.k, autoFor = () => 'stamp', save = () => {};\n" + setter +
+                  "\nconst cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+                  "const looks = cases.map(sourceLook);\n"
+                  "const S = { text: 'A man.' };\n"
+                  "plan = { auto_prompts: { a: { text: 'p', for: 'f', seen: S, lock: true }, b: { text: 'p', for: 'f', seen: S } } };\n"
+                  "setWritten({ k: 'a' }, 'edited'); setWritten({ k: 'b' }, ''); setWritten({ k: 'c' }, 'new');\n"
+                  "console.log(JSON.stringify([looks, plan.auto_prompts]));")
+        run = subprocess.run([node, "-e", script], input=json.dumps(entries), capture_output=True, text=True,
+                             encoding="utf-8")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        looks, prompts = json.loads(run.stdout)
+        self.assertEqual(looks[:4], [
+            {"text": "A man.", "frames": 3, "width": 896, "height": 504, "times": [0.17, 0.5]},
+            {"text": "", "frames": 0, "width": 0, "height": 0, "times": []},   # the VLM answered nothing: shown as such
+            {"text": "x", "frames": 0, "width": 0, "height": 0, "times": []},
+            {"text": "x", "frames": 0, "width": 0, "height": 0, "times": [0.5]}])
+        self.assertEqual(looks[4:], [None] * 7)
+        # an edit keeps what the VLM saw (and the lock); ✕ (empty text) forgets it with the prompt
+        self.assertEqual(prompts, {"a": {"text": "edited", "for": "f", "seen": {"text": "A man."}, "lock": True},
+                                   "b": {"text": "", "for": "f"}, "c": {"text": "new", "for": "stamp"}})

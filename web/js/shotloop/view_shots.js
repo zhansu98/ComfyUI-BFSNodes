@@ -110,6 +110,7 @@ function editor(c, cur) {
     plan.auto_prompt?.enabled ? (() => {
       const w = c.writtenOf(cur), lockOn = w?.lock === true, locked = !!c.lockedOf(cur);
       const old = !locked && w?.text && w.for !== c.autoFor(cur);
+      const look = c.seenOf(cur);
       return h("div", { class: "note", style: "margin-top:6px;padding:6px 8px" }, [
         h("div", { class: "row", style: "gap:6px;align-items:center;margin-bottom:4px" }, [
           h("b", "🤖 Written prompt"), old ? pill("older than the request / pictures / marks", "warn") : null,
@@ -128,6 +129,19 @@ function editor(c, cur) {
           placeholder: lockOn ? "your prompt for this shot (sent as written; {details} {target} still filled)"
             : "not written yet: 🤖 Write, or the planner's VLM writes it when the workflow runs",
           onChange: e => c.setWritten(cur, e.target.value) }),
+        // what the VLM said about the source frames when it last wrote this shot: all the writer knew of the video
+        look ? h("details", { style: "margin-top:4px" }, [
+          h("summary", { class: "hint", style: "cursor:pointer" },
+            `👁 What the VLM saw in the source${look.frames ? ` · ${look.frames} key frame${look.frames === 1 ? "" : "s"}${look.width && look.height ? ` at ${look.width}×${look.height} px` : ""}` : ""}${look.text.trim() ? "" : " · nothing"}`),
+          hint(`From the last time the VLM wrote this shot's prompt${look.times.length ? ` (frames at ${look.times.map(x => `${x.toFixed(2)} s`).join(", ")} into the shot)` : ""}. `
+            + (locked ? "The shot now uses your own prompt ('use my prompt'), so these notes no longer feed it."
+              : "It reads these frames alone, without your request or the pictures, and the prompt writer never sees the video, only this text: what is missing or wrong here is missing or wrong in the prompt. To fix this shot only, edit the prompt above and tick 'use my prompt'. A larger Image max side (VLM) or more Key frames (Prompts & refs) give the look more to see, but changing either re-renders every stored shot."),
+            "display:block;margin:3px 0"),
+          // rawH = Vue's h without the panel's translation: the VLM's words go in as a text node, as they are
+          look.text.trim()
+            ? rawH("div", { style: "white-space:pre-wrap;font-size:11px;max-height:220px;overflow:auto;padding:5px 7px;border:1px solid #2b3557;border-radius:5px;user-select:text" }, look.text)
+            : hint("The VLM answered nothing for these frames, so the writer had no description of the video. Fewer Key frames or a smaller Image max side (VLM) may help (changing either re-renders every stored shot); or write this shot's prompt yourself with 'use my prompt'.", "display:block"),
+        ]) : null,
       ]);
     })() : null,
     usedRefs.value.length ? h("div", { class: "recent" }, [hint("recent (click = picture 1, shift+click = add, or drag onto a slot):"),

@@ -2883,7 +2883,10 @@ def writable_shots(plan: dict, segs: list, indices=None) -> list:
 
 def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, names: list, pictures: list,
                      pic_details: dict, instruction: str, vcfg: dict, template: str = "") -> dict:
-    """Write one shot's prompt: {"text", "for"} (what it was made from, see auto_prompt_for)."""
+    """Write one shot's prompt: {"text", "for", "seen"}: "for" is what it was made from (see auto_prompt_for), "seen"
+    what the VLM said about the source frames ({"text", "frames", "width", "height", "times"}: the answer, how many
+    frames of which size it was shown, and their seconds into the shot). "seen" is for the user to read: nothing
+    reads it back, so it never dates a prompt or changes a stored shot's signature."""
     ap = {**AUTO_PROMPT_DEFAULTS, **(plan.get("auto_prompt") or {})}
     fps = float(analysis["fps"])
     L = seg["end"] - seg["start"]
@@ -2919,14 +2922,30 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
                        "Keep each actor identifiable as positions change. Describe the observed setting, medium, "
                        "lighting and camera. Do not invent unseen movements or infer sound from silent frames. "
                        "Do not assign any Picture reference: none is shown here. Return concise English observations.")
-    source_facts = vlm_generate(clip, source_question, _letterbox_batch(frames), 1024)
+    # the frames as read (the VLM's Image max side, the shot's own aspect), as vlm_shot sends them: this look is all
+    # the writer knows about the video, and a 448 px letterbox loses small faces, hands and people in the background
+    source_facts = str(vlm_generate(clip, source_question, torch.cat(frames, 0), 1024) or "").strip()
+    times = [(int(x) - seg["start"]) / fps for x in picks]
+    # kept with the written prompt and shown under it in the panel: a bad prompt can be told apart from a bad look
+    seen = {"text": source_facts, "frames": len(frames), "width": int(frames[0].shape[2]),
+            "height": int(frames[0].shape[1]), "times": [round(t, 2) for t in times]}
+    said = (f"{tag}: the VLM saw in the source ({seen['frames']} key frame{'' if seen['frames'] == 1 else 's'} at "
+            f"{seen['width']}x{seen['height']}): "
+            f"{source_facts or 'nothing (an empty answer): the writer has no description of the video'}")
+    try:
+        print(said, flush=True)
+    except (UnicodeError, OSError):   # a console that cannot print the model's text must not fail the write:
+        try:                          # it gets the notes with those characters escaped
+            print(said.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
+        except (UnicodeError, OSError):
+            pass
     _status("Writing the shot's prompt with the VLM", force=True)
-    text = write_h3_prompt(clip, frames, [(int(x) - seg["start"]) / fps for x in picks], pictures,
+    text = write_h3_prompt(clip, frames, times, pictures,
                            picture_evidence, request, seg, ap.get("source") or "guide", L / fps,
                            int(vcfg.get("max_tokens") or 1024), [(c - seg["start"]) / fps for c in cuts], tmpl,
                            ap.get("style") or "h3", source_facts=source_facts, prompt_trigger=ap["trigger"],
                            keep_notes=keep_lines)
-    return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template)}
+    return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template), "seen": seen}
 
 
 PLACE_Q = ("This picture shows a place; the patch of black-and-white noise only hides a person, ignore it. Describe the "
@@ -6431,7 +6450,7 @@ try:
     @PromptServer.instance.routes.post("/bfs/shotloop/autoprompt")
     async def _bfs_shot_autoprompt(request):
         """🤖 Auto prompt: the VLM writes the H3 prompt of some shots: body {plan, indices} -> {prompts: {"start-end":
-        {text, for}}}. Locked shots ('use my prompt') are left out."""
+        {text, for, seen}}}. Locked shots ('use my prompt') are left out."""
         body = await request.json()
 
         def work():

@@ -387,7 +387,8 @@ at run time (no click needed).
 
 **Image max side (VLM)** controls the longest side of reference and shot images prepared for VLM analysis (1024 px by
 default). Aspect ratio is preserved; the model's own image processor may resize them further. Increase it when fine
-reference details matter, or lower it to reduce analysis cost. This does not change the generated video size.
+reference details matter, or lower it to reduce analysis cost. This does not change the generated video size. From
+1.124.0 it also sizes the source frames 🤖 Auto prompt reads (see *What the VLM saw in the source*).
 
 When a shot has two references, the planner expands a one-reference template at run time to include `<Subject 2>` and
 `{details2}` for `<Picture 2>` (not when the prompt already names `<Picture 2>` or uses `{details@Picture n}`). 
@@ -428,7 +429,8 @@ writes each shot's MiniMax H3 prompt in the official full-reference format (Mini
 `detailed_description` (`[Shot 1]`, the official camera vocabulary, sounds in time), `overall_soundscape` and
 `non_diegetic_music`. It looks at:
 
-- **key frames of the shot** with their times (*Key frames*: auto = about 1.5 per second, 3 to 8);
+- **key frames of the shot** (*Key frames*: auto = about 1.5 per second, 3 to 8), read first on their own (see *What
+  the VLM saw in the source* below);
 - **the shot's pictures** and their descriptions (Describe references);
 - **the request**, the shot's **Colored Marks** (which tinted person becomes which picture; the mapping is added if the
   writer leaves a color out), its selection / `{target}` and its mode (*Mask only*: only the subject is regenerated;
@@ -477,6 +479,31 @@ unticking it on an up-to-date prompt does not re-render the stored shot, and edi
 in its place. A BFS update of the prompt writer never re-renders a locked shot. Untick it to hand the shot back to the
 VLM: from then on it is checked and rewritten like any other. The switch belongs to the shot's frame range, like its
 written prompt: moving, splitting or merging the shot's cuts leaves the new shot without it.
+
+**What the VLM saw in the source (1.124.0):** the writer works in two steps. First the VLM looks at the shot's key
+frames **alone** (no request, no pictures) and notes the actors, their clothes and starting positions, the actions in
+order, the place, the medium, the light and the camera. Then it writes the prompt **from text only**: those notes, each
+picture's description, your request, the template and the shot's marks, selection and mode. The writer never sees the
+video, so whatever the notes miss or get wrong is missing or wrong in the prompt. Each written prompt keeps its notes:
+open **👁 What the VLM saw in the source** under the shot's 🤖 Written prompt to read them, with how many frames of which
+size the VLM was shown and their times into the shot; the ComfyUI console prints the notes with the frame count and
+size (`[BFS Auto prompt] shot …: the VLM saw in the source …`). Read them when a prompt is off. If the notes are right,
+the writer went wrong: 🤖 Write again, or sharpen the request. If the notes are wrong or thin, the cheapest fix for one
+shot is to edit its prompt and tick **use my prompt**. To give the look more to see for every shot, raise **Image max
+side (VLM)** (small faces, hands, people in the background) or **Key frames** (fast or long action) and write again —
+but **changing either setting re-renders every stored shot**, not only the one you rewrite: both are part of each
+stored shot's signature (as before 1.124.0). The notes themselves are for reading only: they never mark a prompt
+*older* and never re-render a stored shot, editing the prompt keeps them (under *use my prompt* they no longer feed
+it), and ✕ forgets them with the prompt. If the writer fails, the notes of that try are only in the console. Prompts
+written before 1.124.0 have none until they are written again. The notes describe what is in your video and are saved
+in the workflow with the written prompts.
+
+From 1.124.0 the source frames reach the VLM at *Image max side (VLM)* in the shot's own aspect (before, always shrunk
+into a 448 px square with grey bars), all key frames in one request. For a 16:9 video that is about 3 times the pixels
+at the default 1024 px and about 12 times at 2048 px (more for squarer videos), so this look can be slower and need
+more VRAM at high settings; an empty look (*nothing*) can mean it was too much for the model. 448 px gives at most the
+old source-look cost, but the setting also sizes the pictures and other VLM looks, and changing it re-renders stored
+shots as said above.
 
 ### One description per picture (1.113.0)
 

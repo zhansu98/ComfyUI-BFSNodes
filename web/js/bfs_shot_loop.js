@@ -46,6 +46,17 @@ function lockedPrompt(plan, key) {
   return got.text.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "") ? got.text : "";
 }
 
+// 🤖 Auto prompt: what the VLM said it saw in the shot's source frames when it last wrote this prompt (the entry's
+// "seen", from bfs_shot_loop.auto_prompt_shot), or null: {text, frames, width, height, times}. An empty text is a look
+// that answered nothing; a number that is missing or not positive is 0.
+function sourceLook(entry) {
+  const s = entry && typeof entry === "object" ? entry.seen : null;
+  if (!s || typeof s !== "object" || typeof s.text !== "string") return null;
+  const n = v => (Number.isFinite(v) && v > 0 ? v : 0);
+  return { text: s.text, frames: n(s.frames), width: n(s.width), height: n(s.height),
+           times: Array.isArray(s.times) ? s.times.filter(Number.isFinite) : [] };
+}
+
 const viewUrl = name => {
   if (!name) return "";
   const i = name.lastIndexOf("/");
@@ -591,10 +602,12 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   // 🔒 use my prompt: the shot's written prompt is sent as written, never dated or rewritten
   const lockedOf = s => lockedPrompt(plan, segKey(s));
   const setAuto = (k, v) => { plan.auto_prompt = { ...plan.auto_prompt, [k]: v }; save(); };
+  // an edit keeps what the VLM saw in the source; forgetting the prompt (✕, an emptied box) forgets that too
   const setWritten = (s, text) => {
-    const k = segKey(s), cur = plan.auto_prompts[k] || {};
-    plan.auto_prompts = { ...plan.auto_prompts, [k]: { ...cur, text, for: cur.for ?? autoFor(s) } }; save();
+    const k = segKey(s), { seen, ...cur } = plan.auto_prompts[k] || {};
+    plan.auto_prompts = { ...plan.auto_prompts, [k]: { ...cur, text, for: cur.for ?? autoFor(s), ...(text && seen ? { seen } : {}) } }; save();
   };
+  const seenOf = s => sourceLook(writtenOf(s));
   const setLock = (s, on) => {
     const k = segKey(s), { lock, ...cur } = plan.auto_prompts[k] || {};
     plan.auto_prompts = { ...plan.auto_prompts, [k]: on ? { text: "", ...cur, lock: true } : cur }; save();
@@ -955,7 +968,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     applySug, applyAllSug, setCastOpt, setGlobalMaskVideo, setFilter, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
     frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describable, keptPictureDetails, describePictures, setPictureDetail, setPictureCfg,
     setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
-    autoFor, writtenOf, lockedOf, setAuto, setWritten, setLock, writePrompts,
+    autoFor, writtenOf, lockedOf, seenOf, setAuto, setWritten, setLock, writePrompts,
   };
 
   return () => {
