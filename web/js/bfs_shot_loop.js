@@ -82,20 +82,24 @@ function motionSaid(look) {
 
 // 🤖 Auto prompt: what the looks at the source are made with now (bfs_shot_loop.look_settings and the two notes, as
 // auto_prompt_shot records them in a written prompt's `look`): the settings of plan.auto_look, with the Key frames
-// stored before 1.125.0 (auto_prompt.frames) until the new control is used, and this shot's note
+// stored before 1.125.0 (auto_prompt.frames) until the new control is used, this shot's note, and how much of the
+// observations the writer puts into the prompt (writer: "full", or "brief" as before 1.126.0)
 function lookNow(plan, note) {
   const L = plan.auto_look && typeof plan.auto_look === "object" ? plan.auto_look : {};
   return { motion: L.motion == null || L.motion === "" ? "auto" : String(L.motion),
            detail: (L.detail != null ? L.detail : plan.auto_prompt?.frames) || 0, side: parseInt(L.side) || 0,
-           video: typeof L.instruction === "string" ? L.instruction : "", shot: typeof note === "string" ? note : "" };
+           video: typeof L.instruction === "string" ? L.instruction : "", shot: typeof note === "string" ? note : "",
+           writer: L.writer === "brief" ? "brief" : "full" };
 }
 // true when a written prompt was made with other look settings or notes: a soft hint, never the "older" state (a
-// prompt written before 1.125.0 records none and gets no hint)
+// prompt written before 1.125.0 records none and gets no hint; one written with 1.125.0 records no `writer`, which
+// is then not compared: nothing the user set has changed)
 function lookChanged(entry, plan, note) {
   const made = entry && typeof entry === "object" ? entry.look : null;
   if (!made || typeof made !== "object") return false;
   const now = lookNow(plan, note);
-  return ["motion", "detail", "side", "video", "shot"].some(k => String(made[k] ?? "") !== String(now[k] ?? ""));
+  return ["motion", "detail", "side", "video", "shot", "writer"].some(
+    k => (k !== "writer" || made.writer != null) && String(made[k] ?? "") !== String(now[k] ?? ""));
 }
 
 const viewUrl = name => {

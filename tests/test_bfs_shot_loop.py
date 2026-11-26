@@ -3454,6 +3454,8 @@ class LookSignatureTest(unittest.TestCase):
         changes = [dict(auto_look={"motion": "off"}), dict(auto_look={"motion": 8}), dict(auto_look={"motion": 32}),
                    dict(auto_look={"detail": 2}), dict(auto_look={"detail": 12}), dict(auto_look={"side": 2048}),
                    dict(auto_look={"instruction": "this is a dance video: name each move"}), dict(segs=noted),
+                   dict(auto_look={"writer": "brief"}), dict(auto_look={"writer": "full"}),
+                   dict(auto_prompts={"0-120": {**entry, "seen": seen, "look": {**look, "writer": "brief"}}}),
                    dict(auto_prompts={"0-120": {**entry, "seen": seen, "look": look}}),
                    dict(auto_look={"motion": 32, "detail": 12, "side": 2048, "instruction": "x"}, segs=noted,
                         auto_prompts={"0-120": {**entry, "seen": seen, "look": look}})]
@@ -3508,7 +3510,8 @@ class TwoLooksTest(unittest.TestCase):
             "text": "DETAIL", "frames": 4, "width": 1024, "height": 576, "times": [round(x / 24, 2) for x in d_picks],
             "motion": {"text": "MOTION", "frames": 20, "width": 448, "height": 252,
                        "times": [round(x / 24, 2) for x in m_picks]}})
-        self.assertEqual(out["look"], {"motion": "auto", "detail": 0, "side": 0, "video": "", "shot": ""})
+        self.assertEqual(out["look"], {"motion": "auto", "detail": 0, "side": 0, "video": "", "shot": "",
+                                       "writer": "full"})
         self.assertIn("shot 0-120: the VLM saw in the source (4 key frames at 1024x576): DETAIL", printed)
         self.assertIn("shot 0-120: the VLM saw the motion in the source (20 frames at 448x252): MOTION", printed)
         self.assertEqual(wrote[0]["source_facts"], SL.source_notes("DETAIL", "MOTION", ""))
@@ -4071,7 +4074,8 @@ class TwoLooksTest(unittest.TestCase):
                       "number that is not plainly a count, or a line too long to be one beat): " + " | ".join(gone), printed)
 
     def test_look_settings_and_counts(self):
-        self.assertEqual(SL.look_settings({}), {"motion": "auto", "detail": 0, "side": 0, "instruction": ""})
+        self.assertEqual(SL.look_settings({}), {"motion": "auto", "detail": 0, "side": 0, "instruction": "",
+                                                "writer": "full"})
         self.assertEqual(SL.look_settings({"auto_look": "junk"})["motion"], "auto")
         # Key frames: the new control's value, else the one stored before 1.125.0 (auto_prompt.frames)
         legacy = {"auto_prompt": {"frames": 6}}
@@ -4252,8 +4256,9 @@ class LookNotesTest(unittest.TestCase):
         note = "tears\non both cheeks"
         made = [_run_looks(legacy)[0]["look"],
                 _run_looks(full, seg={"start": 0, "end": 120, "prompt": "", "look_note": note})[0]["look"]]
-        self.assertEqual(made[0], {"motion": "auto", "detail": 6, "side": 0, "video": "", "shot": ""})
-        self.assertEqual(made[1], {"motion": "12", "detail": 3, "side": 1536, "video": "dance\nvideo", "shot": note})
+        self.assertEqual(made[0], {"motion": "auto", "detail": 6, "side": 0, "video": "", "shot": "", "writer": "full"})
+        self.assertEqual(made[1], {"motion": "12", "detail": 3, "side": 1536, "video": "dance\nvideo", "shot": note,
+                                   "writer": "full"})
         cases = [[{"text": "p", "look": made[0]}, legacy, ""], [{"text": "p", "look": made[1]}, full, note],
                  [{"text": "p"}, full, note], [None, full, note], [{"text": "p", "look": "x"}, full, note],
                  [{"text": "p", "look": made[0]}, {"auto_look": {}, "auto_prompt": {"frames": 8}}, ""],
@@ -4538,3 +4543,313 @@ class ConditionTransferTest(unittest.TestCase):
             self.assertIs(wrote[0]["carry_conditions"], True)
         _, _, wrote, _ = _run_looks()   # the rule goes with every prompt written from now on
         self.assertIs(wrote[0]["carry_conditions"], True)
+
+
+# ---------------------------------------------------------------------------- 1.126.0: the observations in full
+
+class FullNotesTest(unittest.TestCase):
+    """The writer puts all that the looks observed into the shot's description (a template used to get three to six
+    sentences of it). plan["auto_look"]["writer"] = "brief" writes as 1.125.0 did."""
+
+    TEMPLATE = ConditionTransferTest.TEMPLATE
+    ANSWER = ConditionTransferTest.ANSWER   # its detailed_description has 7 words
+    BEATS = "\n".join(["The woman raises her right hand to her face.", "She turns her head to the left.",
+                       "She wipes her cheek with the back of her hand.", "The camera pushes in slowly.",
+                       "She looks down and steps back towards the door.", "She leaves the frame on the right."])
+    LONG = ANSWER.replace(
+        "<Subject 1> walks.",
+        "<Subject 1> raises his right hand to his face, then turns his head to the left. He wipes his cheek with the "
+        "back of his hand while the camera pushes in slowly. He looks down, steps back towards the door and leaves "
+        "the frame on the right.")
+    THIN = ("detailed_description summarises the observed actions: write every observed beat in it, one sentence or "
+            "clause each, in order, and invent no action that was not observed")
+
+    def _write(self, answers=None, seg=None, **kw):
+        import contextlib
+        import io
+        asks, answers, printed = [], list(answers or [self.ANSWER]), io.StringIO()
+        self.tokens = []
+
+        def generate(clip, prompt, images, tokens, *a, **k):
+            asks.append(prompt)
+            self.tokens.append(tokens)
+            return answers[min(len(asks), len(answers)) - 1]
+        with patch.object(SL, "vlm_generate", side_effect=generate), contextlib.redirect_stdout(printed):
+            text = SL.write_h3_prompt(None, [torch.zeros(1, 8, 8, 3)], [0.5], [torch.zeros(1, 4, 4, 3)],
+                                      ["a man in a suit"], "Replace the woman with <Picture 1>.",
+                                      seg or {"start": 0, "end": 24}, "guide", duration=1.0, **kw)
+        self.printed = printed.getvalue()
+        return asks, text
+
+    def test_without_it_the_writer_is_asked_as_before(self):
+        import hashlib
+        for name, (kw, golden) in ConditionTransferTest.GOLDEN.items():
+            for more in ({}, {"full": False}, {"full": False, "beats": self.BEATS}):
+                ask = self._write(**kw, **more)[0]   # the first request (the caption style asks this answer again)
+                self.assertEqual(hashlib.sha1(ask[0].encode("utf-8")).hexdigest()[:16], golden, (name, more))
+        self.assertEqual(SL.AUTO_PROMPT_REVISION, "fitted-picture-details-v8")   # no stored prompt is written again
+        # and it is given the room it had: more only for the fuller description
+        for kw, want in ((dict(), 1536), (dict(full=True), 2048), (dict(style="captions"), 512),
+                         (dict(style="captions", full=True), 512), (dict(max_tokens=4096), 4096),
+                         (dict(max_tokens=4096, full=True), 4096)):
+            self._write([self.LONG], source_facts="A woman waves.", **{"max_tokens": 1024, **kw})
+            self.assertEqual(self.tokens[0], want, kw)
+
+    def test_a_template_gets_the_shot_in_full_instead_of_three_to_six_sentences(self):
+        kw = dict(source_facts="A woman waves.", template=self.TEMPLATE)
+        old, new = self._write(**kw)[0][0], self._write(**kw, full=True)[0][0]
+        self.assertEqual(old.count(SL.AUTO_TEMPLATE_SHOT), 1)
+        self.assertTrue(SL.AUTO_TEMPLATE_SHOT.startswith("add three to six sentences on this shot:"))
+        self.assertEqual(new, old.replace(SL.AUTO_TEMPLATE_SHOT, SL.AUTO_TEMPLATE_SHOT_FULL) + "\n\n" + SL.AUTO_FULL_RULES)
+        self.assertNotIn("three to six sentences", new)
+        line = [x for x in new.split("\n") if x.startswith("- In detailed_description, right after")]
+        self.assertEqual(len(line), 1)
+        for word in ('right after "[Shot 1]" (add "[Shot 1]" if the template has none), describe this shot in full',
+                     "as long as the source observations need", "a shot with few observed beats stays short",
+                     "one with many may take up to about 400 words",
+                     "never replace several beats by one general sentence",
+                     "first the camera distance and angle, the place and the light",
+                     "in the order observed", "one sentence or clause for every observed beat",
+                     "with each camera movement (static shot, push in, pull out, pan left, pan right, tilt up, tilt "
+                     "down, tracking shot...) where it happens.",
+                     "The source is one continuous shot: write only [Shot 1] and no timestamp at all.",
+                     "Never write a timestamp inside a shot."):
+            self.assertIn(word, line[0])
+
+    def test_the_other_formats(self):
+        for kw in (dict(source_facts="A woman waves."), dict(), dict(source_facts="A woman waves.", cuts=[0.5])):
+            old, new = self._write(**kw)[0][0], self._write(**kw, full=True)[0][0]
+            self.assertEqual(new, old + "\n\n" + SL.AUTO_FULL_RULES, kw)   # the six sections: the rule comes on top
+        kw = dict(source_facts="A woman waves.", style="captions")
+        self.assertEqual(self._write(**kw, full=True)[0], self._write(**kw)[0])   # two to four sentences stay that
+
+    def test_the_rule_and_where_it_stands(self):
+        rules = SL.AUTO_FULL_RULES
+        for word in ("The source observations are the material of the shot's description",
+                     "Every action, gesture, turn, step, glance (where the actor looks), change of expression",
+                     "contact with another actor or with an object",
+                     # what the user typed about the shot is asked for like what the looks saw
+                     "entrance, exit and camera movement that they or the user's facts name is written in "
+                     "detailed_description", "in the order observed",
+                     # a camera cut keeps its shots and its time; a crop its frame
+                     "each beat in the [Shot n] it happens in",
+                     "(a line 'Camera cut.' in the observations is where the next shot starts)",
+                     "In a crop shot this means the selected subject and what touches it; actors and objects outside "
+                     "the crop are left out.",
+                     "the subject that replaces that actor", "One observed beat gets a sentence or clause of its own",
+                     "Never fold several beats into a general sentence", "'performs the same movements'",
+                     "This is about the sentences you add; a template's own sentences are handled as the template "
+                     "rules say.",
+                     "which hand, arm, leg or side (retargeted to the replacing subject's own body, as the rules above "
+                     "say)", "which direction", "where the actor looks",
+                     "Never replace a specific observation with a vaguer one",
+                     # the actor's name in the notes is often clothing: it must not come along
+                     "For an actor who is replaced, the name the observations give that actor (for example 'the woman "
+                     "in the red dress') is not used for the beats: say once whom the subject replaces, then write "
+                     "the replacing subject's label (in a template, the template's own).",
+                     "wherever the request does not change them",
+                     "the lasting appearance of a source actor who is replaced (the rules above)",
+                     # the request's changes and the pictures are not 'observed' and are written all the same
+                     "any action, gesture or camera movement that neither the observations nor the user's facts name "
+                     "(what the request changes and what the reference pictures show is still written, as the rules "
+                     "above say)",
+                     "clock times and frame numbers inside a shot (the 'At mm:ss' that opens a new [Shot n] at a camera "
+                     "cut stays)", "Never invent a beat", "describe each beat once",
+                     "an action repeated several times in a row is written once, with how often it repeats."):
+            self.assertIn(word, rules)
+        self.assertNotIn(" look,", rules)   # 'looks' is appearance in the notes' headings
+        # temporary conditions still come last ("this rule comes last"), after the rule on the observations
+        lines = {"": SL.AUTO_CONDITION_H3, self.TEMPLATE: SL.AUTO_CONDITION_TEMPLATE}
+        for template, line in lines.items():
+            kw = dict(source_facts="A woman waves.", template=template)
+            full = self._write(**kw, full=True)[0][0]
+            both = self._write(**kw, full=True, carry_conditions=True)[0][0]
+            self.assertEqual(both, full + "\n\n" + SL.AUTO_CONDITION_RULES + "\n" + line)
+            self.assertTrue(full.endswith(SL.AUTO_FULL_RULES))
+
+    def test_a_description_much_shorter_than_the_beats_is_a_problem(self):
+        beats = " ".join(["word"] * 100)
+
+        def text(n, tail="\noverall_soundscape:\nN/A"):
+            return "summary:\nx y z.\ndetailed_description:\n" + " ".join(["w"] * n) + tail
+        self.assertEqual((SL.FULL_WORDS_RATIO, SL.FULL_MIN_WORDS, SL.FULL_NEED_CAP), (0.5, 40, 250))
+        self.assertEqual(SL.thin_description(text(50), beats), [])
+        self.assertEqual(SL.thin_description(text(49), beats), [self.THIN])
+        # the message asks for beats, not for words: a count would be met by copying the notes
+        self.assertNotRegex(self.THIN, r"\d")
+        self.assertIn("invent no action that was not observed", self.THIN)
+        # only detailed_description counts: up to the next section or the end
+        self.assertEqual(SL.described_words(text(49)), 49)
+        self.assertEqual(SL.described_words(text(49, "")), 49)
+        self.assertEqual(SL.described_words(text(49, "\nretention_analysis:\n" + "w " * 50)), 49)
+        self.assertEqual(SL.described_words(text(49, "\n  summary:\n" + "w " * 50)), 49)     # a section starts a line
+        self.assertEqual(SL.described_words(text(49, " overall_soundscape: " + "w " * 50)), 49)   # or is no prose
+        self.assertEqual(SL.described_words(text(49, " non_diegetic_music: N/A")), 49)
+        self.assertEqual(SL.described_words(text(30, " In summary: " + "w " * 30 + "\noverall_soundscape:\nN/A")), 62)
+        self.assertEqual(SL.thin_description(text(30, " In summary: " + "w " * 30 + "\noverall_soundscape:\nN/A"), beats), [])
+        self.assertIsNone(SL.described_words("no sections here"))
+        self.assertIsNone(SL.described_words(None))
+        self.assertEqual(SL.thin_description("no sections here", beats), [])   # no label: not measured
+        self.assertEqual(SL.thin_description(text(50, ""), beats), [])
+        self.assertEqual(SL.thin_description(text(49, ""), beats), [self.THIN])
+        # a line of the notes counts once, however often it is there and however it is written
+        line = "She steps to the left and raises both arms high."   # 10 words
+        self.assertEqual(SL.thin_description(text(1), "\n".join([line] * 10)), [])          # 10 words: not measured
+        five = [line.replace("left", w) for w in ("left", "right", "front", "back", "side")]
+        twice = "\n".join(five + [x.upper().replace(".", " !") for x in five] + ["", "  "])  # 50 words, each twice
+        self.assertEqual(SL.thin_description(text(25), twice), [])
+        self.assertEqual(SL.thin_description(text(24), twice), [self.THIN])
+        # long notes: 125 words are always enough
+        long = " ".join(["word"] * 600)
+        self.assertEqual(SL.thin_description(text(125), long), [])
+        self.assertEqual(SL.thin_description(text(124), long), [self.THIN])
+        # the template's own words in the section carry no beat
+        self.assertEqual(SL.thin_description(text(60), beats, 10), [])
+        self.assertEqual(SL.thin_description(text(60), beats, 11), [self.THIN])
+        self.assertEqual(SL.thin_description(text(60), beats, None), [])
+        # few notes are not measured
+        self.assertEqual(SL.thin_description(text(1), " ".join(["word"] * 39)), [])
+        self.assertEqual(SL.thin_description(text(1), " ".join(["word"] * 40)), [self.THIN])
+        for nothing in ("", None):
+            self.assertEqual(SL.thin_description(text(1), nothing), [])
+
+    def test_the_writer_is_asked_again_when_it_summarised(self):
+        self.assertEqual(len(self.BEATS.split()), 47)
+        self.assertEqual((SL.described_words(self.ANSWER), SL.described_words(self.LONG)), (7, 51))
+        kw = dict(source_facts="A woman waves.", full=True, beats=self.BEATS)
+        asks, text = self._write([self.ANSWER, self.LONG], **kw)
+        self.assertEqual(len(asks), 2)
+        self.assertEqual(asks[1], asks[0] + "\n\nA previous answer had these problems, avoid them: " + self.THIN + ".")
+        self.assertIn("leaves the frame on the right.", text)        # the fuller answer is the prompt
+        self.assertIn("[BFS Auto prompt] writing again: " + self.THIN + "\n", self.printed)
+        self.assertIn("[BFS Auto prompt] the second answer is the prompt\n", self.printed)
+        # nothing is measured without the rule, without beats, for few beats, for a full answer or for a crop
+        for more in (dict(full=False), dict(beats=""), dict(beats="She waves."), dict(seg={"start": 0, "end": 24, "crop": True}),
+                     dict(seg={"start": 0, "end": 24, "crop": True, "inpaint": True})):
+            self.assertEqual(len(self._write([self.ANSWER, self.LONG], **{**kw, **more})[0]), 1, more)
+            self.assertNotIn("answer is the prompt", self.printed)
+        self.assertEqual(len(self._write([self.LONG], **kw)[0]), 1)
+        self.assertEqual(self.printed, "")
+        masked = {"start": 0, "end": 24, "inpaint": True}   # everything else stays in frame: measured
+        self.assertEqual(len(self._write([self.ANSWER, self.LONG], **{**kw, "seg": masked})[0]), 2)
+        # the caption style has no detailed_description to measure
+        self.assertEqual(len(self._write(["Replace the woman in the video with the man from <Picture 1>."],
+                                         **{**kw, "style": "captions"})[0]), 1)
+
+    def test_which_of_the_two_answers_is_the_prompt(self):
+        kw = dict(source_facts="A woman waves.", full=True, beats=self.BEATS)
+        other = self.ANSWER.replace("walks.", "strolls.")                                      # as short
+        mid = self.ANSWER.replace("<Subject 1> walks.", "<Subject 1> walks slowly to the door and stops.")
+        bad_ref = self.LONG.replace("the man in <Picture 1>", "the man in <Picture 3>")       # full, a wrong picture
+        no_label = self.ANSWER.replace("[Shot 1] <Subject 1> walks.", "[Shot 1] He walks.")    # thin, never names it
+        no_label_long = self.LONG.replace("<Subject 1> raises his", "He raises his")
+        no_section = self.LONG.replace("retention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - x.\n", "")
+        self.assertEqual((SL.described_words(other), SL.described_words(mid)), (7, 13))
+        self.assertEqual(len(SL.thin_description(mid, self.BEATS)), 1)
+        self.assertEqual([len(SL.h3_prompt_problems(x, 1)) for x in (bad_ref, no_label, no_label_long, no_section)],
+                         [1, 1, 1, 1])
+        self.assertNotEqual(SL.h3_prompt_problems(no_label, 1), SL.h3_prompt_problems(no_section, 1))
+        self.assertEqual(SL.h3_prompt_problems(no_label, 1), SL.h3_prompt_problems(no_label_long, 1))
+        cases = [
+            # first, second, the prompt holds, which
+            (self.ANSWER, other, "walks.", "first"),             # no longer: the first stays
+            (self.ANSWER, mid, "to the door and stops.", "second"),   # longer, though still short of the beats
+            (mid, self.ANSWER, "to the door and stops.", "first"),    # shorter
+            (self.ANSWER, bad_ref, "walks.", "first"),           # longer, with a problem the first had not
+            (no_label, no_section, "retention_analysis:", "first"),   # another problem instead: no better
+            (no_label, no_label_long, "leaves the frame on the right.", "second"),   # the same problem, and fuller
+            (no_label, self.ANSWER, "<Subject 1> walks.", "second"),                 # the problem repaired
+        ]
+        for first, second, holds, which in cases:
+            asks, text = self._write([first, second], **kw)
+            self.assertEqual(len(asks), 2, holds)
+            self.assertIn(holds, text, (which, holds))
+            self.assertIn(f"[BFS Auto prompt] the {which} answer is the prompt\n", self.printed, holds)
+        # a repair is never turned down for its length: a wrong picture number fails the write otherwise
+        asks, text = self._write([bad_ref, self.ANSWER], **kw)
+        self.assertEqual(len(asks), 2)
+        self.assertIn("<Subject 1> walks.", text)
+        self.assertNotIn("answer is the prompt", self.printed)   # the first was no summary: as before 1.126.0
+        with self.assertRaises(ValueError):
+            self._write([bad_ref, bad_ref], **kw)
+        # nor when the first answer was a summary as well: the repair wins though it says no more
+        thin_bad_ref = self.ANSWER.replace("the man in <Picture 1>", "the man in <Picture 3>")
+        asks, text = self._write([thin_bad_ref, other], **kw)
+        self.assertEqual(len(asks), 2)
+        self.assertTrue(asks[1].endswith("avoid them: <Picture 3> does not exist: only 1 reference pictures are "
+                                         "connected; " + self.THIN + "."))   # told both
+        self.assertIn("writing again: <Picture 3> does not exist: only 1 reference pictures are connected; "
+                      + self.THIN + "\n", self.printed)
+        self.assertIn("strolls.", text)
+        self.assertIn("[BFS Auto prompt] the second answer is the prompt\n", self.printed)
+        # and a first answer that was no summary is not given up for a longer one with the same problem
+        longer = no_label_long.replace("on the right.", "on the right. He comes back and waves.")
+        asks, text = self._write([no_label_long, longer], **kw)
+        self.assertEqual(len(asks), 2)
+        self.assertNotIn("He comes back and waves.", text)
+
+    def test_a_templates_own_words_carry_no_beat(self):
+        own = ("<Subject 1> takes the exact place of the person in the guide video and keeps their timing, pose, "
+               "gestures, head motion, gaze and expressions throughout the whole shot without any change at all.")
+        template = ("body_swap: subject_definitions: <Subject 1> is the man shown in <Picture 1>.\n"
+                    "summary: Replace the guide subject with <Subject 1>.\ndetailed_description: [Shot 1] " + own)
+        self.assertEqual(SL.described_words(template), 35)
+        self.assertEqual(SL.thin_description(template, self.BEATS), [])           # 35 words pass on their own
+        self.assertEqual(SL.thin_description(template, self.BEATS, 35), [self.THIN])
+        added = template + " He raises his right hand to his face, then turns his head to the left and wipes his " \
+                           "cheek with the back of his hand while the camera pushes in slowly, then leaves the frame."
+        kw = dict(source_facts="A woman waves.", template=template, full=True, beats=self.BEATS)
+        asks, text = self._write([template, added], **kw)   # the template as it came: nothing of the shot is in it
+        self.assertEqual(len(asks), 2)
+        self.assertIn("then leaves the frame.", text)
+        self.assertEqual(len(self._write([added], **kw)[0]), 1)
+
+    def test_auto_prompt_asks_for_it_unless_the_plan_says_brief(self):
+        out, _, wrote, _ = _run_looks()
+        self.assertIs(wrote[0]["full"], True)
+        self.assertEqual(wrote[0]["beats"], "MOTION")   # the motion notes the writer got
+        self.assertEqual(out["look"]["writer"], "full")
+        out, _, wrote, _ = _run_looks({"auto_look": {"writer": "brief"}})
+        self.assertIs(wrote[0]["full"], False)
+        self.assertIs(wrote[0]["carry_conditions"], True)
+        self.assertEqual(out["look"]["writer"], "brief")
+        # no motion notes for the writer: nothing to measure the prompt against
+        _, _, wrote, _ = _run_looks({"auto_look": {"motion": "off"}})
+        self.assertEqual((wrote[0]["full"], wrote[0]["beats"]), (True, ""))
+        unusable = "He turns.\nAt 1.2 s he waves."   # one sentence kept, one left out: the notes are not used
+        self.assertEqual(SL.untimed(unusable), "He turns.")
+        for said in ("At 1.2 s he turns.", unusable):
+            _, _, wrote, _ = _run_looks(answers=("DETAIL", said))
+            self.assertEqual((wrote[0]["full"], wrote[0]["beats"]), (True, ""), said)
+            self.assertNotIn("He turns.", wrote[0]["source_facts"])
+        for given, want in ((None, "full"), ("", "full"), ("full", "full"), ("brief", "brief"), ("BRIEF", "full"),
+                            (0, "full"), (False, "full"), ("short", "full")):
+            self.assertEqual(SL.look_settings({"auto_look": {"writer": given}})["writer"], want, given)
+
+    def test_the_panel_offers_it_and_hints_softly(self):
+        src = _panel_src()
+        helper = src[src.index("function sourceLook"):src.index("const viewUrl")]
+        old = {"motion": "auto", "detail": 0, "side": 0, "video": "", "shot": ""}   # as 1.125.0 recorded it
+        cases = [[{"text": "p", "look": old}, {}, ""],                                     # written before 1.126.0
+                 [{"text": "p", "look": old}, {"auto_look": {"writer": "brief"}}, ""],
+                 [{"text": "p", "look": {**old, "writer": "full"}}, {}, ""],
+                 [{"text": "p", "look": {**old, "writer": "full"}}, {"auto_look": {"writer": "full"}}, ""],
+                 [{"text": "p", "look": {**old, "writer": "full"}}, {"auto_look": {"writer": "junk"}}, ""],
+                 [{"text": "p", "look": {**old, "writer": "brief"}}, {"auto_look": {"writer": "brief"}}, ""],
+                 [{"text": "p", "look": {**old, "writer": "full"}}, {"auto_look": {"writer": "brief"}}, ""],
+                 [{"text": "p", "look": {**old, "writer": "brief"}}, {}, ""],
+                 [{"text": "p", "look": {**old, "writer": "brief"}}, {"auto_look": {"writer": "junk"}}, ""]]
+        got = _node(helper + "\nconst cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+                    "console.log(JSON.stringify(cases.map(([e, p, n]) => lookChanged(e, p, n))));", cases)
+        if got is None:
+            self.skipTest("node is not installed")
+        self.assertEqual(got, [False, False, False, False, False, False, True, True, True])
+        view = (ROOT / "web/js/shotloop/view_prompts.js").read_text(encoding="utf-8")
+        self.assertIn('fld("Shot description", select(L.writer === "brief" ? "brief" : "full", '
+                      '[["full", "full (every observed beat)"], ["brief", "short (as before 1.126.0)"]],', view)
+        self.assertIn('v => c.setLook("writer", v)', view)
+        self.assertIn("Key frames, Motion frames, Key frame size, Shot description and this instruction never re-render "
+                      "a stored shot and never mark a prompt older", view)
+        docs = (ROOT / "web/js/docs/BFSShotPlanner.md").read_text(encoding="utf-8")
+        self.assertIn("**The observations in full (1.126.0):**", docs)
+        self.assertIn('version = "1.126.0"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))

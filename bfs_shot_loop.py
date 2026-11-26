@@ -2459,9 +2459,19 @@ AUTO_TEMPLATE_RULES = """The user's request is a prompt TEMPLATE (for example th
 - Keep its first word{trigger} exactly as the very first text of your answer.
 - Where the template describes a subject in general words, add the visible features from the reference pictures and their descriptions.
 - Apply the user's request to it (who is replaced by whom, what changes), in the template's own words.
-- In detailed_description, right after "[Shot 1]" (add "[Shot 1]" if the template has none), add three to six sentences on this shot: the camera distance, angle and movement (static shot, push in, pull out, pan left, pan right, tilt up, tilt down, tracking shot...), the place and the light, and what the person does in order. {shots_rule} Never write a timestamp inside a shot.
+- In detailed_description, right after "[Shot 1]" (add "[Shot 1]" if the template has none), {shot_text} {shots_rule} Never write a timestamp inside a shot.
 - Keep every label as written, with angle brackets: <Subject 1>, <Picture 1>.
 Return only the finished prompt, with nothing before or after it."""
+# what a template's shot gets ({shot_text}): a few sentences, or (1.126.0, write_h3_prompt's `full`) all that was observed
+AUTO_TEMPLATE_SHOT = ("add three to six sentences on this shot: the camera distance, angle and movement (static shot, "
+                      "push in, pull out, pan left, pan right, tilt up, tilt down, tracking shot...), the place and the "
+                      "light, and what the person does in order.")
+AUTO_TEMPLATE_SHOT_FULL = ("describe this shot in full, as long as the source observations need (a shot with few "
+                           "observed beats stays short; one with many may take up to about 400 words; never replace "
+                           "several beats by one general sentence): first the camera distance and angle, the place and "
+                           "the light, then the performance in the order observed, one sentence or clause for every "
+                           "observed beat, with each camera movement (static shot, push in, pull out, pan left, pan "
+                           "right, tilt up, tilt down, tracking shot...) where it happens.")
 
 # Concise edit-request format, retained for existing saved workflows.
 AUTO_CAPTION_RULES = """Write the prompt in the short style of a video-edit request: two to four sentences in English, one paragraph, no section names, no labels other than <Picture n>, no lists, no markdown.
@@ -2520,6 +2530,53 @@ AUTO_CONDITION_TEMPLATE = ("Where to write it: in the sentences you add after [S
 AUTO_CONDITION_CAPTION = ("Where to write it: in one short clause right after the replacement the condition belongs to, "
                           "naming its <Picture n>.")
 
+# 1.126.0: appended to the writer's rules by auto_prompt_shot (write_h3_prompt's `full`), before the rule on temporary
+# conditions; not for the caption style, which stays two to four sentences
+AUTO_FULL_RULES = """Using the source observations (how much of them the prompt carries):
+- The source observations are the material of the shot's description, not background reading. Every action, gesture, turn, step, glance (where the actor looks), change of expression, contact with another actor or with an object, entrance, exit and camera movement that they or the user's facts name is written in detailed_description, in the order observed, each beat in the [Shot n] it happens in (a line 'Camera cut.' in the observations is where the next shot starts), as done by the subject that replaces that actor (or by the source actor or object itself where the request leaves it unchanged). In a crop shot this means the selected subject and what touches it; actors and objects outside the crop are left out.
+- One observed beat gets a sentence or clause of its own. Never fold several beats into a general sentence such as 'performs the same movements', 'continues the action' or 'moves naturally'. This is about the sentences you add; a template's own sentences are handled as the template rules say.
+- Keep the concrete words of the observations: which hand, arm, leg or side (retargeted to the replacing subject's own body, as the rules above say), which direction (left, right, towards or away from the camera), where in the frame, how fast and how far, where the actor looks, what is held or touched, how the expression changes. Never replace a specific observation with a vaguer one. For an actor who is replaced, the name the observations give that actor (for example 'the woman in the red dress') is not used for the beats: say once whom the subject replaces, then write the replacing subject's label (in a template, the template's own).
+- Keep the observed framing (camera distance and angle), place and light as well, wherever the request does not change them.
+- What stays out: the lasting appearance of a source actor who is replaced (the rules above), clock times and frame numbers inside a shot (the 'At mm:ss' that opens a new [Shot n] at a camera cut stays), and any action, gesture or camera movement that neither the observations nor the user's facts name (what the request changes and what the reference pictures show is still written, as the rules above say). Never invent a beat to fill space, and describe each beat once: an action repeated several times in a row is written once, with how often it repeats."""
+# when the writer summarised all the same (thin_description): it is asked once more. A coarse measure in words, set
+# well below what a prompt that carries every beat has (about 0.6 to 1 word per word of notes: it drops the actors'
+# names) and above a summary in a few sentences (about 0.2 to 0.45, in words about the action: the description's
+# other words, on style, place and the subjects, count as well, so a summary beside much of those passes)
+FULL_MIN_WORDS = 40      # fewer words of motion notes are not measured against the written prompt
+FULL_WORDS_RATIO = 0.5   # detailed_description has at least this many words per word of motion notes, or it is thin
+FULL_NEED_CAP = 250      # the words of motion notes that are asked for at most (long notes: 125 words are enough)
+_SECTION_END = re.compile(r"(?:^|\n)[ \t]*(?:" + "|".join(H3_SECTIONS) + r"):"
+                          r"|(?:subject_definitions|retention_analysis|overall_soundscape|non_diegetic_music):")
+
+
+def described_words(text) -> int | None:
+    """The words of a prompt's (or a template's) detailed_description: from its label to the next section, which
+    starts a line (any section) or is one of the names no sentence holds ('In summary: ...' inside the description
+    ends nothing); None without the label."""
+    text = str(text or "")
+    i = text.find("detailed_description:")
+    if i < 0:
+        return None
+    i += len("detailed_description:")
+    end = _SECTION_END.search(text, i)
+    return len(text[i:end.start() if end else len(text)].split())
+
+
+def thin_description(text: str, beats, own: int = 0) -> list[str]:
+    """With the full rule: the problem of a written prompt whose detailed_description is much shorter than the motion
+    notes it was to carry, i.e. the writer summarised them; [] otherwise. Measured in words: the description's, less
+    the `own` words of the template's description, against the notes' (each different line once, FULL_NEED_CAP at
+    most). Few notes (under FULL_MIN_WORDS) and a prompt without that section are not measured."""
+    lines = {}
+    for line in str(beats or "").split("\n"):   # a line said again (the camera stays static) asks for nothing more
+        lines.setdefault(re.sub(r"\W+", " ", line.lower()).strip(), len(line.split()))
+    need = sum(n for key, n in lines.items() if key)
+    have = described_words(text)
+    if need < FULL_MIN_WORDS or have is None or have - int(own or 0) >= FULL_WORDS_RATIO * min(need, FULL_NEED_CAP):
+        return []
+    return ["detailed_description summarises the observed actions: write every observed beat in it, one sentence or "
+            "clause each, in order, and invent no action that was not observed"]
+
 
 def clean_note(text, limit: int = LOOK_NOTE_LIMIT) -> str:
     """An instruction or note of the user as it reaches the VLM: one line (so it cannot open a block of its own, such
@@ -2537,7 +2594,8 @@ def clean_note(text, limit: int = LOOK_NOTE_LIMIT) -> str:
 def look_settings(plan: dict) -> dict:
     """plan["auto_look"] with its defaults: {"motion": "auto" | "off" | 4..32 (small frames), "detail": 0 = auto, else
     the number of large key frames (the Key frames stored before 1.125.0, auto_prompt.frames, until the new control
-    is used), "side": 0 = the VLM's Image max side, else the large frames' longest side, "instruction": as typed}."""
+    is used), "side": 0 = the VLM's Image max side, else the large frames' longest side, "instruction": as typed,
+    "writer": "full" (the writer puts all that was observed into the shot's description) | "brief" (as 1.125.0)}."""
     look = plan.get("auto_look") if isinstance(plan.get("auto_look"), dict) else {}
 
     def number(value) -> int:
@@ -2558,7 +2616,8 @@ def look_settings(plan: dict) -> dict:
     detail = look["detail"] if look.get("detail") is not None else (plan.get("auto_prompt") or {}).get("frames")
     side = number(look.get("side"))
     return {"motion": motion, "detail": number(detail), "side": max(224, min(4096, side)) if side else 0,
-            "instruction": look["instruction"] if isinstance(look.get("instruction"), str) else ""}
+            "instruction": look["instruction"] if isinstance(look.get("instruction"), str) else "",
+            "writer": "brief" if look.get("writer") == "brief" else "full"}
 
 
 def motion_frame_count(length: int, fps: float, motion) -> int:
@@ -2860,13 +2919,20 @@ def written_prompt_for(plan: dict, seg: dict, names: list, request: str, templat
 def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_texts: list, instruction: str,
                     seg: dict, source: str = "guide", duration: float = 0.0, max_tokens: int = 2048,
                     cuts: list | None = None, template: str = "", style: str = "h3", source_facts: str | None = None, prompt_trigger: str = "motion_transfer",
-                    keep_notes: list | None = None, carry_conditions: bool = False) -> str:
+                    keep_notes: list | None = None, carry_conditions: bool = False, full: bool = False,
+                    beats: str = "") -> str:
     """One shot's prompt in H3's full-reference format, written by the VLM from key frames of the shot ([1,H,W,3] each,
     at `times` seconds into it), the shot's reference pictures (<Picture 1> first) with their descriptions, the user's
     request and the shot's Colored Marks, selection and mode. keep_notes (the user's kept picture descriptions) are
     added to the request once it is known whether the request is a whole template, so they never become template text.
     carry_conditions adds the rule that temporary conditions of the source performance (tears, sweat...) are carried
-    over to the replacing subject (AUTO_CONDITION_RULES); without it the writer is asked exactly as before 1.125.0."""
+    over to the replacing subject (AUTO_CONDITION_RULES); without it the writer is asked exactly as before 1.125.0.
+    full (1.126.0) asks for all that the source observations name in the shot's description (AUTO_FULL_RULES; a
+    template's shot is then described in full instead of in three to six sentences), and a prompt whose
+    detailed_description is much shorter than `beats` (the motion notes the writer got) is asked for again
+    (thin_description; not for a crop shot, whose prompt leaves out what is outside the crop). Of the two answers the
+    one with fewer of the other problems is the prompt, as before; the second also when it has no problem the first
+    had not and a longer detailed_description. The caption style stays as it is. Without `full` nothing changes."""
     nf, npics = len(frames), len(pictures)
     tt = ", ".join(_mmss(t) for t in times) if times else ""
     pics = ""
@@ -2925,7 +2991,8 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
     if captions:
         rules = AUTO_CAPTION_RULES
     elif template:
-        rules = AUTO_TEMPLATE_RULES.format(trigger=f" '{trigger}'" if trigger else "", shots_rule=shots_rule)
+        rules = AUTO_TEMPLATE_RULES.format(trigger=f" '{trigger}'" if trigger else "", shots_rule=shots_rule,
+                                           shot_text=AUTO_TEMPLATE_SHOT_FULL if full else AUTO_TEMPLATE_SHOT)
     else:
         rules = AUTO_PROMPT_RULES.format(source_line=source_line, summary_start=summary_start, source_name=source_name,
                                          video_label=video_label, shots_rule=shots_rule)
@@ -2959,22 +3026,35 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
         images = None
     else:
         images = _letterbox_batch(list(frames) + list(pictures))
+    full = bool(full) and not captions
+    if full:
+        ask += "\n\n" + AUTO_FULL_RULES
     if carry_conditions:
         ask += ("\n\n" + AUTO_CONDITION_RULES + "\n"
                 + (AUTO_CONDITION_CAPTION if captions else AUTO_CONDITION_TEMPLATE if template else AUTO_CONDITION_H3))
-    tokens = 512 if captions else max(1536, int(max_tokens))
+    tokens = 512 if captions else max(2048 if full else 1536, int(max_tokens))   # room for the fuller description
     sampling = {"temperature": 0.6, "repetition_penalty": 1.1, "presence_penalty": 0.8}
     tidy = (lambda t: tidy_caption(t, seg, trigger)) if captions else \
         (lambda t: tidy_h3_prompt(t, seg, trigger, bool(cuts), npics, bool(template)))
     check = (lambda t: caption_problems(t, npics)) if captions else (lambda t: h3_prompt_problems(t, npics, bool(template)))
+    own = (described_words(template) or 0) if template else 0   # the template's own words there carry no beat
+    measured = full and mode not in ("crop", "cropmask")        # a crop's prompt leaves out what is outside it
     text = tidy(vlm_generate(clip, ask, images, tokens, sampling=sampling))
     problems = check(text)
-    if problems:   # one more try, told what was wrong
-        print(f"[BFS Auto prompt] writing again: {'; '.join(problems)}", flush=True)
-        again = (ask + "\n\nA previous answer had these problems, avoid them: " + "; ".join(problems) + ".")
+    thin = thin_description(text, beats, own) if measured else []
+    if problems or thin:   # one more try, told what was wrong
+        print(f"[BFS Auto prompt] writing again: {'; '.join(problems + thin)}", flush=True)
+        again = (ask + "\n\nA previous answer had these problems, avoid them: " + "; ".join(problems + thin) + ".")
         text2 = tidy(vlm_generate(clip, again, images, tokens, seed=1, sampling=sampling))
-        if len(check(text2)) < len(problems):
+        problems2 = check(text2)
+        # fewer problems win, as before. A summary (thin) never outweighs them: it only lets a second answer in that
+        # has no problem the first had not and says more
+        fuller = bool(thin) and set(problems2) <= set(problems) and \
+            (described_words(text2) or 0) > (described_words(text) or 0)
+        if len(problems2) < len(problems) or fuller:
             text = text2
+        if thin:
+            print(f"[BFS Auto prompt] the {'second' if text is text2 else 'first'} answer is the prompt", flush=True)
     invalid_refs = picture_index_problems(text, npics)
     if invalid_refs:
         raise ValueError("Prompt writer could not preserve reference indices: " + "; ".join(invalid_refs) + ". Check the request/reference list and Write again.")
@@ -3245,7 +3325,8 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
     same five keys under "motion" for the small frames (its answer as written), plus, only when they apply: "error"
     (the look failed: its message), "left_out" (how many sentences were not given to the writer: see untimed), "unused" (True: the writer got none of the motion notes), "again" ("used", "empty" or "failed": the
     key frames were then looked at again in full, and how that ended) and "again_error". "look" is what the looks
-    were made with (look_settings and the two notes as stored), for the panel's hint that they have changed. "seen"
+    were made with (look_settings, with "writer", and the two notes as stored), for the panel's hint that they have
+    changed. "seen"
     and "look" are for the user to read: nothing reads them back, so they never date a prompt or change a stored
     shot's signature."""
     ap = {**AUTO_PROMPT_DEFAULTS, **(plan.get("auto_prompt") or {})}
@@ -3375,10 +3456,12 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
                            picture_evidence, request, seg, ap.get("source") or "guide", L / fps,
                            int(vcfg.get("max_tokens") or 1024), cut_times, tmpl,
                            ap.get("style") or "h3", source_facts=source_notes(source_facts, motion_notes, shot_note),
-                           prompt_trigger=ap["trigger"], keep_notes=keep_lines, carry_conditions=True)
+                           prompt_trigger=ap["trigger"], keep_notes=keep_lines, carry_conditions=True,
+                           full=look["writer"] == "full", beats=motion_notes)
     return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template), "seen": seen,
             "look": {"motion": str(look["motion"]), "detail": look["detail"], "side": look["side"],
-                     "video": look["instruction"], "shot": str(seg.get("look_note") or "")}}
+                     "video": look["instruction"], "shot": str(seg.get("look_note") or ""),
+                     "writer": look["writer"]}}
 
 
 PLACE_Q = ("This picture shows a place; the patch of black-and-white noise only hides a person, ignore it. Describe the "

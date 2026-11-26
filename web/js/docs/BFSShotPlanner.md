@@ -549,7 +549,7 @@ is written, and you can tell it what to look for.
   same number can cover other frames. The panel marks such a note in amber (*typed when this shot covered other
   frames*); check that it still fits, and edit it to confirm it.
 
-**Nothing here re-renders other shots.** Key frames, Motion frames, Key frame size, the instruction and the notes are
+**Nothing here re-renders other shots.** Key frames, Motion frames, Key frame size, Shot description (1.126.0), the instruction and the notes are
 kept apart from the settings a stored shot is checked against. Changing them never renders a stored shot again and
 never marks a prompt *older*, so no run rewrites a prompt because of them. They apply to prompts written after the
 change: click 🤖 Write again on the shots you want redone (a shot whose prompt text changes is rendered again, as
@@ -595,6 +595,43 @@ start* reaches the writer whatever the VLM saw.
 
 **Prompts you already have** are not touched by the update: they keep their text and were written with the old rules
 (one look, no temporary conditions) until you 🤖 Write them again.
+
+**The observations in full (1.126.0):** the looks of 1.125.0 notice much more than the written prompt used to carry.
+When the request is a prompt **template** (the node's `prompt` input, as with a LoRA's training prompt), the writer
+was told to add *three to six sentences* about the shot, so twenty observed beats were squeezed into a few general
+sentences. Now the writer is told to use everything the looks observed:
+
+- every action, gesture, turn, look, change of expression, contact with another actor or an object, entrance, exit
+  and camera movement, **in the order observed**, one sentence or clause per beat, never folded into *performs the
+  same movements*;
+- with its concrete words: which hand or side, which direction, where in the frame, how fast, where the actor looks,
+  what is held or touched;
+- the observed framing, place and light too, wherever your request does not change them;
+- still **not** the lasting appearance of an actor who is replaced, no clock times, and no action the looks or your
+  shot note did not name (what your request changes and what the pictures show is written as before).
+
+A template's shot is described as long as the observations need: short for a shot with few beats, up to about 400
+words for one with many; the template's own sentences stay as they are. The six-section style already asked for 250
+to 450 words and gets the same rule on top. The short *caption* style stays two to four sentences. At a camera cut
+inside a shot the beats go into the `[Shot n]` they happen in, and in a crop shot only the selected subject and what
+touches it is described.
+
+If the writer still summarises, it is asked once more. The measure is coarse, in words: the `detailed_description`
+(less the words the template already has there) must have at least half as many words as the motion notes, where each
+different line of the notes counts once and at most 250 of their words are asked for (so 125 words beyond the
+template's own always pass; words on style, place and the subjects count too, so the measure only catches a plain
+summary). It is
+measured only when the motion notes have 40 words or more, never for a crop shot, and only when the prompt has a
+`detailed_description:` label. The second answer becomes the prompt when it has fewer of the other problems (a
+missing section, a wrong picture number...), as before, or when it has no problem the first had not and a longer
+`detailed_description`; otherwise the first stays. The console prints `writing again: detailed_description summarises
+the observed actions ...` and which answer became the prompt. It costs that shot one more answer from the writer.
+
+**Shot description** (🤖 Auto prompt card): *full* (the default) or *short (as before 1.126.0)*. Like the look
+settings it never re-renders a stored shot and never marks a prompt *older*: it applies to prompts written after the
+change. Prompts you already have keep their text; 🤖 Write them again to get the full description (a shot whose prompt
+text changes is rendered again, as always). Longer prompts are not always better for the video model: if a shot
+follows the action worse with the full description, set *short* and write that shot again.
 
 ### One description per picture (1.113.0)
 

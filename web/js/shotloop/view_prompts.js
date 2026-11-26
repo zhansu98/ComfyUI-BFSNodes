@@ -138,6 +138,8 @@ function autoSection(c) {
         v => c.setLook("motion", v), { style: "width:auto" }), "small frames (half the key frames' size, 224 to 448 px) with their times, for actions and camera"),
       fld("Key frame size", select(String(L.side || 0), [["0", "as Image max side (VLM)"], ...[448, 672, 896, 1024, 1280, 1536, 2048].map(n => [String(n), `${n} px`])],
         v => c.setLook("side", parseInt(v) || 0), { style: "width:auto" }), "the key frames' size alone: larger shows small things on faces (tears, sweat) in wide shots and costs more VLM time and memory, smaller costs less"),
+      fld("Shot description", select(L.writer === "brief" ? "brief" : "full", [["full", "full (every observed beat)"], ["brief", "short (as before 1.126.0)"]],
+        v => c.setLook("writer", v), { style: "width:auto" }), "how much of what the VLM saw in the source the writer puts into the prompt · full: every action and camera move, in order, with its concrete details (a template's shot is no longer cut to three to six sentences) · the caption style stays short"),
       fld("Source video in the prompt", select(A.source || "guide", [["guide", "guide video (aligned guide)"], ["video", "<Video 1> (native reference video)"]],
         v => c.setAuto("source", v), { style: "width:auto" }), "match the conditioning node's guide_mode"),
       h("button", { class: "pri", disabled: !!busy.value || !S.length || locked === S.length,
@@ -148,7 +150,7 @@ function autoSection(c) {
     h("textarea", { maxlength: 600, style: "margin-top:6px;min-height:40px", value: L.instruction || "",
       placeholder: "Instruction for the VLM's looks at the source, for every shot (optional), e.g. 'this is a dance video: name each move' or 'ignore the crowd in the background'",
       onChange: e => c.setLook("instruction", e.target.value) }),
-    hint("Read by both looks at every shot (not by the prompt writer). Key frames, Motion frames, Key frame size and this instruction never re-render a stored shot and never mark a prompt older: they apply to prompts written after the change (🤖 Write again). Each shot has its own note box above its written prompt (Shots tab).", "display:block;margin-top:3px"),
+    hint("Read by both looks at every shot (not by the prompt writer). Key frames, Motion frames, Key frame size, Shot description and this instruction never re-render a stored shot and never mark a prompt older: they apply to prompts written after the change (🤖 Write again). Each shot has its own note box above its written prompt (Shots tab).", "display:block;margin-top:3px"),
     A.enabled && A.template ? h("div", { class: "hint", style: "display:block;margin-top:4px", title: A.template },
       `Template (the node's prompt input, last run): ${A.template.slice(0, 110)}${A.template.length > 110 ? "…" : ""} · the prompt boxes are the request applied to it`) : null,
     hint(A.enabled ? `${S.length - missing}/${S.length} shots have a written prompt${stale ? ` · ${stale} older than their request, pictures or marks` : ""}${locked ? ` · ${locked} 🔒 yours ('use my prompt', never rewritten)` : ""}${relook ? ` · ${relook} written with other look settings or notes` : ""}${failed ? ` · ${failed} written without the motion look (it gave nothing)` : ""} · shots without one are written when the workflow runs (with the VLM on the planner) · edit them in each shot (Shots tab)`
