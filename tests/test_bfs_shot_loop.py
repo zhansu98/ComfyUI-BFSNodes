@@ -3204,6 +3204,9 @@ class SourceLookTest(unittest.TestCase):
 
 # ---------------------------------------------------------------------------- 1.125.0: two looks, notes, conditions
 
+AUTO_TOKENS = {"write_tokens": 0, "detail_tokens": 0, "motion_tokens": 0}   # 1.127.0: the answers' limits, on auto
+
+
 def _run_looks(plan=None, seg=None, answers=("DETAIL", "MOTION"), vcfg=None, cuts=(), writer=None, analysis=None,
                names=("a.png",), bad_size=None):
     """auto_prompt_shot with the VLM and the writer replaced -> (out, looks, wrote, printed). looks: one dict per
@@ -3455,6 +3458,11 @@ class LookSignatureTest(unittest.TestCase):
                    dict(auto_look={"detail": 2}), dict(auto_look={"detail": 12}), dict(auto_look={"side": 2048}),
                    dict(auto_look={"instruction": "this is a dance video: name each move"}), dict(segs=noted),
                    dict(auto_look={"writer": "brief"}), dict(auto_look={"writer": "full"}),
+                   dict(auto_look={"write_tokens": 4096}), dict(auto_look={"detail_tokens": 2048}),
+                   dict(auto_look={"motion_tokens": 1536}),
+                   dict(auto_look={"write_tokens": 8192, "detail_tokens": 4096, "motion_tokens": 4096, "writer": "brief"}),
+                   dict(auto_prompts={"0-120": {**entry, "seen": seen, "look": {
+                       **look, "writer": "full", "write_tokens": 4096, "detail_tokens": 2048, "motion_tokens": 1536}}}),
                    dict(auto_prompts={"0-120": {**entry, "seen": seen, "look": {**look, "writer": "brief"}}}),
                    dict(auto_prompts={"0-120": {**entry, "seen": seen, "look": look}}),
                    dict(auto_look={"motion": 32, "detail": 12, "side": 2048, "instruction": "x"}, segs=noted,
@@ -3511,7 +3519,7 @@ class TwoLooksTest(unittest.TestCase):
             "motion": {"text": "MOTION", "frames": 20, "width": 448, "height": 252,
                        "times": [round(x / 24, 2) for x in m_picks]}})
         self.assertEqual(out["look"], {"motion": "auto", "detail": 0, "side": 0, "video": "", "shot": "",
-                                       "writer": "full"})
+                                       "writer": "full", **AUTO_TOKENS})
         self.assertIn("shot 0-120: the VLM saw in the source (4 key frames at 1024x576): DETAIL", printed)
         self.assertIn("shot 0-120: the VLM saw the motion in the source (20 frames at 448x252): MOTION", printed)
         self.assertEqual(wrote[0]["source_facts"], SL.source_notes("DETAIL", "MOTION", ""))
@@ -4075,7 +4083,7 @@ class TwoLooksTest(unittest.TestCase):
 
     def test_look_settings_and_counts(self):
         self.assertEqual(SL.look_settings({}), {"motion": "auto", "detail": 0, "side": 0, "instruction": "",
-                                                "writer": "full"})
+                                                "writer": "full", **AUTO_TOKENS})
         self.assertEqual(SL.look_settings({"auto_look": "junk"})["motion"], "auto")
         # Key frames: the new control's value, else the one stored before 1.125.0 (auto_prompt.frames)
         legacy = {"auto_prompt": {"frames": 6}}
@@ -4256,9 +4264,10 @@ class LookNotesTest(unittest.TestCase):
         note = "tears\non both cheeks"
         made = [_run_looks(legacy)[0]["look"],
                 _run_looks(full, seg={"start": 0, "end": 120, "prompt": "", "look_note": note})[0]["look"]]
-        self.assertEqual(made[0], {"motion": "auto", "detail": 6, "side": 0, "video": "", "shot": "", "writer": "full"})
+        self.assertEqual(made[0], {"motion": "auto", "detail": 6, "side": 0, "video": "", "shot": "", "writer": "full",
+                                   **AUTO_TOKENS})
         self.assertEqual(made[1], {"motion": "12", "detail": 3, "side": 1536, "video": "dance\nvideo", "shot": note,
-                                   "writer": "full"})
+                                   "writer": "full", **AUTO_TOKENS})
         cases = [[{"text": "p", "look": made[0]}, legacy, ""], [{"text": "p", "look": made[1]}, full, note],
                  [{"text": "p"}, full, note], [None, full, note], [{"text": "p", "look": "x"}, full, note],
                  [{"text": "p", "look": made[0]}, {"auto_look": {}, "auto_prompt": {"frames": 8}}, ""],
@@ -4848,8 +4857,190 @@ class FullNotesTest(unittest.TestCase):
         self.assertIn('fld("Shot description", select(L.writer === "brief" ? "brief" : "full", '
                       '[["full", "full (every observed beat)"], ["brief", "short (as before 1.126.0)"]],', view)
         self.assertIn('v => c.setLook("writer", v)', view)
-        self.assertIn("Key frames, Motion frames, Key frame size, Shot description and this instruction never re-render "
-                      "a stored shot and never mark a prompt older", view)
+        self.assertIn("Key frames, Motion frames, Key frame size, Shot description, the three max tokens and this "
+                      "instruction never re-render a stored shot and never mark a prompt older", view)
         docs = (ROOT / "web/js/docs/BFSShotPlanner.md").read_text(encoding="utf-8")
         self.assertIn("**The observations in full (1.126.0):**", docs)
-        self.assertIn('version = "1.126.0"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------- 1.127.0: the answers' token limits
+
+class TokenLimitsTest(unittest.TestCase):
+    """How long each answer of 🤖 Auto prompt may be is the user's to set, in plan["auto_look"]: write_tokens (the
+    prompt writer), detail_tokens (the look at the key frames) and motion_tokens (the look at the motion frames).
+    0 = auto: the room each had in 1.126.0. Like every look setting they are in no stored shot's signature."""
+
+    ANSWER, LONG, BEATS, TEMPLATE = FullNotesTest.ANSWER, FullNotesTest.LONG, FullNotesTest.BEATS, FullNotesTest.TEMPLATE
+    _write = FullNotesTest._write
+    UNUSABLE = "At 1.2 s he turns."   # a motion answer the writer gets nothing of: the key frames are looked at again
+    SET = {"write_tokens": 4096, "detail_tokens": 2048, "motion_tokens": 1536}
+
+    def test_on_auto_every_answer_has_the_room_it_had(self):
+        self.assertEqual((SL.DETAIL_TOKENS, SL.MOTION_TOKENS), (1024, 768))
+        for plan in ({}, {"auto_look": {}}, {"auto_look": dict(AUTO_TOKENS)}, {"auto_look": "junk"},
+                     {"auto_look": {"write_tokens": None, "detail_tokens": "", "motion_tokens": "auto"}}):
+            out, looks, wrote, _ = _run_looks(plan, answers=("DETAIL", self.UNUSABLE, "AGAIN"))
+            self.assertEqual(out["seen"]["motion"]["again"], "used", plan)   # three looks: the key frames twice
+            self.assertEqual([x["max_tokens"] for x in looks], [1024, 768, 1024], plan)
+            self.assertEqual(wrote[0]["limit"], 0, plan)
+            self.assertEqual({k: out["look"][k] for k in AUTO_TOKENS}, AUTO_TOKENS, plan)
+        # the VLM card's Max tokens reaches the writer as before (its floor is the writer's own business)
+        _, looks, wrote, _ = _run_looks(vcfg={"max_tokens": 4096})
+        self.assertEqual(([x["max_tokens"] for x in looks], wrote[0]["args"][9], wrote[0]["limit"]), ([1024, 768], 4096, 0))
+
+    def test_the_plan_sets_each_answers_limit(self):
+        answers = ("DETAIL", self.UNUSABLE, "AGAIN")
+        out, looks, wrote, _ = _run_looks({"auto_look": self.SET}, answers=answers)
+        self.assertEqual([x["max_tokens"] for x in looks], [2048, 1536, 2048])   # the second look at the key frames too
+        self.assertEqual(wrote[0]["limit"], 4096)
+        self.assertEqual({k: out["look"][k] for k in AUTO_TOKENS}, self.SET)   # kept with the prompt, for the hint
+        # nothing else changes: the same questions, the same frames, the same request to the writer
+        out0, looks0, wrote0, _ = _run_looks(answers=answers)
+        self.assertEqual([x["prompt"] for x in looks], [x["prompt"] for x in looks0])
+        self.assertEqual([tuple(x["images"].shape) for x in looks], [tuple(x["images"].shape) for x in looks0])
+        rest = lambda w: {k: v for k, v in w.items() if k not in ("args", "limit")}   # noqa: E731
+        self.assertEqual(rest(wrote[0]), rest(wrote0[0]))
+        self.assertEqual(wrote[0]["args"][9], wrote0[0]["args"][9])
+        self.assertEqual(out["seen"], out0["seen"])
+        # each alone leaves the other two on auto
+        for key, want in (("detail_tokens", ([512, 768], 0)), ("motion_tokens", ([1024, 512], 0)),
+                          ("write_tokens", ([1024, 768], 512))):
+            out, looks, wrote, _ = _run_looks({"auto_look": {key: 512}})
+            self.assertEqual(([x["max_tokens"] for x in looks], wrote[0]["limit"]), want, key)
+            self.assertEqual({k: out["look"][k] for k in AUTO_TOKENS}, {**AUTO_TOKENS, key: 512}, key)
+        # one look only (Motion frames off): its limit is the key frames' one
+        _, looks, wrote, _ = _run_looks({"auto_look": {"motion": "off", **self.SET}})
+        self.assertEqual(([x["max_tokens"] for x in looks], wrote[0]["limit"]), ([2048], 4096))
+        # and the short description (as before 1.126.0) is limited the same way
+        _, looks, wrote, _ = _run_looks({"auto_look": {"writer": "brief", **self.SET}})
+        self.assertEqual(([x["max_tokens"] for x in looks], wrote[0]["limit"], wrote[0]["full"]), ([2048, 1536], 4096, False))
+
+    def test_the_writer_answers_within_the_limit(self):
+        for kw, want in ((dict(limit=3072), 3072), (dict(limit=3072, full=True), 3072),
+                         (dict(limit=1024, full=True), 1024),          # below the room of auto: the user's to lower
+                         (dict(limit=1024), 1024),
+                         (dict(limit=3072, max_tokens=4096), 3072),    # it is the limit, whatever the VLM card says
+                         (dict(limit=3072, full=True, template=self.TEMPLATE), 3072),
+                         (dict(limit=0), 1536), (dict(limit=None), 1536), (dict(limit=0, full=True), 2048),
+                         (dict(limit=0, max_tokens=4096), 4096),
+                         (dict(limit=3072, style="captions"), 512),    # two to four sentences stay that
+                         (dict(limit=128, style="captions"), 512)):
+            self._write([self.LONG], source_facts="A woman waves.", **{"max_tokens": 1024, **kw})
+            self.assertEqual(set(self.tokens), {want}, kw)   # (the caption style asks this six-section answer again)
+        # an answer asked again gets the same room
+        kw = dict(source_facts="A woman waves.", full=True, beats=self.BEATS)
+        asks, _ = self._write([self.ANSWER, self.LONG], limit=3072, **kw)
+        self.assertEqual((len(asks), self.tokens), (2, [3072, 3072]))
+        # and the limit is no word of the request
+        for more in (dict(), dict(template=self.TEMPLATE), dict(style="captions")):
+            self.assertEqual(self._write([self.ANSWER, self.LONG], limit=3072, **kw, **more)[0],
+                             self._write([self.ANSWER, self.LONG], **kw, **more)[0], more)
+
+    def test_limits_are_whole_numbers_in_range(self):
+        for key, lo, hi in (("write_tokens", 256, 8192), ("detail_tokens", 128, 4096), ("motion_tokens", 128, 4096)):
+            for given, want in ((None, 0), ("", 0), (0, 0), ("0", 0), ("auto", 0), ("junk", 0), (-5, 0), ("-5", 0),
+                                (False, 0), (True, 0), ([], 0), ([2048], 0), ({}, 0), (float("inf"), 0),
+                                (float("nan"), 0), (1, lo), (lo - 1, lo), (lo, lo), (2048, 2048), ("2048", 2048),
+                                (2048.9, 2048), (hi, hi), (hi + 1, hi), (10 ** 9, hi), (1e21, hi), (10 ** 30, hi),
+                                (1e-7, 0), (0.9, 0), (-0.5, 0),
+                                # a text is a limit only when it is 1 to 9 digits and nothing else
+                                ("2048.5", 0), ("1e3", 0), (" 2048", 0), ("2048 ", 0), ("2048\n", 0), ("0x800", 0),
+                                ("2_048", 0), ("2,048", 0), ("2048abc", 0), ("1024px", 0), ("+2048", 0),
+                                ("\u0662\u0660\u0664\u0668", 0), ("9" * 9, hi), ("9" * 10, 0), ("0" * 9, 0),
+                                ("000002048", 2048), (["2048"], 0), ({"a": 1}, 0)):
+                got = SL.look_settings({"auto_look": {key: given}})
+                self.assertEqual(got[key], want, (key, given))
+                self.assertIs(type(got[key]), int, (key, given))
+                self.assertEqual({k: got[k] for k in AUTO_TOKENS if k != key}, {k: 0 for k in AUTO_TOKENS if k != key})
+        # a size or a count that is no number does not stop the write either
+        got = SL.look_settings({"auto_look": {"side": float("inf"), "detail": float("inf"), "motion": float("inf")}})
+        self.assertEqual((got["side"], got["detail"], got["motion"]), (0, 0, "auto"))
+
+    def test_the_panel_offers_them_and_hints_softly(self):
+        view = (ROOT / "web/js/shotloop/view_prompts.js").read_text(encoding="utf-8")
+        steps = "...[512, 768, 1024, 1536, 2048, 3072, 4096].map(n => [String(n), String(n)])]"
+        for line in ('fld("Prompt max tokens", select(String(parseInt(L.write_tokens) || 0), [["0", "auto (2048 · short: '
+                     '1536)"], ...[1024, 1536, 2048, 3072, 4096, 6144, 8192].map(n => [String(n), String(n)])],',
+                     'v => c.setLook("write_tokens", parseInt(v) || 0)',
+                     'fld("Key look max tokens", select(String(parseInt(L.detail_tokens) || 0), [["0", "auto (1024)"], '
+                     + steps, 'v => c.setLook("detail_tokens", parseInt(v) || 0)',
+                     'fld("Motion look max tokens", select(String(parseInt(L.motion_tokens) || 0), [["0", "auto (768)"], '
+                     + steps, 'v => c.setLook("motion_tokens", parseInt(v) || 0)',
+                     "Key frames, Motion frames, Key frame size, Shot description, the three max tokens and this "
+                     "instruction never re-render a stored shot and never mark a prompt older"):
+            self.assertEqual(view.count(line), 1, line)
+        # the VLM card's own Max tokens is hashed into every stored shot's signature: its help says so
+        common = (ROOT / "web/js/shotloop/common.js").read_text(encoding="utf-8")
+        self.assertIn('"Max tokens": "Longest VLM answer for Analyse and the picture descriptions. Changing it renders '
+                      "every stored shot again: 🤖 Auto prompt has its own limits (Prompt max tokens, Key look max "
+                      'tokens, Motion look max tokens), which never do.",', common)
+        docs = (ROOT / "web/js/docs/BFSShotPlanner.md").read_text(encoding="utf-8")
+        self.assertIn("**Answer limits (1.127.0):**", docs)
+        # what a cut answer looks like: the six-section style is tidied (tidy_h3_prompt), so it never 'lacks its last
+        # sections' and seldom 'stops in the middle of a sentence'; only a template's prompt does
+        flat = " ".join(docs.replace("\r\n", "\n").split())
+        for said in ("Nothing in the panel says that an answer was cut",
+                     "the **writer, with a template**: the written prompt stops in the middle of a sentence;",
+                     "the **writer, six-section style**: harder to see, because the prompt is tidied. The cut sentence "
+                     "is usually dropped and the prompt is closed with the stock lines *The ambient sound of the guide "
+                     "video continues throughout.* and *N/A*, so it looks complete while its description ends before "
+                     "the shot does",
+                     "A limit below auto saves time only when the VLM rambles, and makes a cut more likely",
+                     "A higher limit reserves a little more VLM memory before the answer starts, whatever its length"):
+            self.assertIn(said, flat)
+        self.assertIn("which nothing in the panel says: the shot's description then ends before the shot does (a "
+                      "template's prompt stops in the middle of a sentence; the six-section style drops the cut sentence "
+                      "and still closes with its stock line 'The ambient sound of the guide video continues "
+                      "throughout.')", view)
+        for text in (docs, view):
+            self.assertNotIn("lacks its last sections", text)
+        self.assertEqual(SL.tidy_h3_prompt("subject_definitions:\nA man.\nsummary:\nHe waves.\ndetailed_description:\n"
+                                           "[Shot 1] He waves. He steps back towards the do").split("\n")[-5:],
+                         ["[Shot 1] He waves.", "overall_soundscape:",
+                          "The ambient sound of the guide video continues throughout.", "non_diegetic_music:", "N/A"])
+        # the help's words are the key of its translations (pt, es, zh): the new text has them
+        import re
+        tip = ("Longest VLM answer for Analyse and the picture descriptions. Changing it renders every stored shot again: "
+               "\U0001f916 Auto prompt has its own limits (Prompt max tokens, Key look max tokens, Motion look max tokens), "
+               "which never do.")
+        self.assertEqual(common.count('"' + tip + '"'), 2)   # the tip and its entry in TEXT
+        self.assertRegex(common, re.escape('"' + tip + '": [') + r'"Tamanho[^"]+", "Longitud[^"]+", "VLM [^"]+"\],')
+        self.assertNotIn("Longest VLM answer. Raise it for long descriptions.", common)
+        self.assertIn('version = "1.127.0"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        src = _panel_src()
+        helper = src[src.index("function sourceLook"):src.index("const viewUrl")]
+        old = {"motion": "auto", "detail": 0, "side": 0, "video": "", "shot": "", "writer": "full"}   # as 1.126.0 did
+        new = {**old, **AUTO_TOKENS}
+        look = lambda **k: {"text": "p", "look": {**new, **k}}   # noqa: E731
+        cases = [[{"text": "p", "look": old}, {}, ""],                                     # written with 1.126.0
+                 [look(), {}, ""], [look(), {"auto_look": dict(AUTO_TOKENS)}, ""],
+                 [look(), {"auto_look": {"write_tokens": "junk", "detail_tokens": None, "motion_tokens": ""}}, ""],
+                 [look(**self.SET), {"auto_look": self.SET}, ""],
+                 [look(**self.SET), {"auto_look": {k: str(v) for k, v in self.SET.items()}}, ""],
+                 [look(write_tokens=256), {"auto_look": {"write_tokens": 100}}, ""],       # as the server reads it
+                 [look(detail_tokens=4096), {"auto_look": {"detail_tokens": 9999}}, ""],
+                 [{"text": "p"}, {"auto_look": self.SET}, ""],                             # before 1.125.0: no hint
+                 # a prompt of 1.126.0 was written with the limits on auto: a limit set since then is a change
+                 [{"text": "p", "look": old}, {"auto_look": {"write_tokens": 4096}}, ""],
+                 [{"text": "p", "look": old}, {"auto_look": {"detail_tokens": 2048}}, ""],
+                 [{"text": "p", "look": old}, {"auto_look": {"motion_tokens": 1536}}, ""],
+                 [look(), {"auto_look": {"write_tokens": 4096}}, ""], [look(), {"auto_look": {"detail_tokens": 2048}}, ""],
+                 [look(), {"auto_look": {"motion_tokens": 1536}}, ""], [look(**self.SET), {}, ""],
+                 [look(write_tokens=4096), {"auto_look": {"write_tokens": 2048}}, ""]]
+        got = _node(helper + "\nconst cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+                    "console.log(JSON.stringify(cases.map(([e, p, n]) => lookChanged(e, p, n))));", cases)
+        if got is None:
+            self.skipTest("node is not installed")
+        self.assertEqual(got, [False] * 9 + [True] * 8)
+        # the panel reads a limit as the server does, whatever a plan written by hand or by a script holds
+        values = [None, "", 0, "0", "auto", "junk", -5, "-5", False, True, [], {}, 1, 127, 128, 255, 256, 2048, "2048",
+                  2048.9, 4096, 4097, 8192, 8193, 10 ** 9, [2048], ["2048"], [2048, 1], {"a": 1}, "0x800", "2048abc",
+                  "2048.5", "1024px", "1e3", "5e2", "2,048", "2_048", "\u0662\u0660\u0664\u0668", " 2048", "2048 ",
+                  "2048\n", "+2048", "9" * 9, "9" * 10, "000002048", 1e-7, 0.9, -0.5, 1e21, 1e30, 10 ** 22]
+        plans = [{"auto_look": {k: v for k in AUTO_TOKENS}} for v in values]
+        got = _node(helper + "\nconst plans = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+                    "console.log(JSON.stringify(plans.map(p => { const n = lookNow(p, ''); return "
+                    "{ write_tokens: n.write_tokens, detail_tokens: n.detail_tokens, motion_tokens: n.motion_tokens }; })));",
+                    plans)
+        want = [SL.look_settings(p) for p in plans]
+        self.assertEqual(got, [{k: w[k] for k in AUTO_TOKENS} for w in want])

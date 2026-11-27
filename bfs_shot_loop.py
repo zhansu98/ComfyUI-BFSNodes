@@ -2500,6 +2500,12 @@ def auto_frame_count(length: int, fps: float, frames: int = 0) -> int:
 MOTION_SIDE = 448        # the small frames' longest side at most (16:9: 448x252, 112 vision tokens each for
                          # Qwen3-VL); see motion_side
 LOOK_NOTE_LIMIT = 600    # characters of an instruction or a note that reach the VLM
+# 1.127.0: the most tokens an answer of Auto prompt may have is the user's to set (plan.auto_look: detail_tokens,
+# motion_tokens, write_tokens; see look_settings). Left on auto, the two looks have what they had before:
+DETAIL_TOKENS = 1024     # the look at the key frames (SOURCE_QUESTION)
+MOTION_TOKENS = 768      # the look at the motion frames (motion_question)
+LOOK_TOKENS_RANGE = (128, 4096)    # a limit set for a look
+WRITE_TOKENS_RANGE = (256, 8192)   # a limit set for the prompt writer (auto: write_h3_prompt's own room)
 
 SOURCE_QUESTION = (
     "These images are ONLY chronological frames of the SOURCE video, not replacement "
@@ -2595,14 +2601,29 @@ def look_settings(plan: dict) -> dict:
     """plan["auto_look"] with its defaults: {"motion": "auto" | "off" | 4..32 (small frames), "detail": 0 = auto, else
     the number of large key frames (the Key frames stored before 1.125.0, auto_prompt.frames, until the new control
     is used), "side": 0 = the VLM's Image max side, else the large frames' longest side, "instruction": as typed,
-    "writer": "full" (the writer puts all that was observed into the shot's description) | "brief" (as 1.125.0)}."""
+    "writer": "full" (the writer puts all that was observed into the shot's description) | "brief" (as 1.125.0),
+    "detail_tokens", "motion_tokens", "write_tokens": 0 = auto (as before 1.127.0), else the most tokens the answer of
+    the look at the key frames, of the look at the motion frames and of the prompt writer may have}."""
     look = plan.get("auto_look") if isinstance(plan.get("auto_look"), dict) else {}
 
     def number(value) -> int:
         try:
             return int(value or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):   # OverflowError: an infinite number
             return 0
+
+    def tokens(value, lowest: int, highest: int) -> int:
+        # a number (cut to a whole one) or a text of 1 to 9 digits and nothing else; all the rest is auto. The panel
+        # reads a limit the same way (tokenLimit in web/js/bfs_shot_loop.js), or its hint would never go away
+        if isinstance(value, bool):
+            n = 0
+        elif isinstance(value, (int, float)):
+            n = number(value)
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]{1,9}", value):
+            n = int(value)
+        else:
+            n = 0
+        return max(lowest, min(highest, n)) if n > 0 else 0
     m = look.get("motion")
     if m is None or m == "" or m == "auto":
         motion = "auto"
@@ -2611,13 +2632,16 @@ def look_settings(plan: dict) -> dict:
     else:
         try:
             motion = max(4, min(32, int(m)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             motion = "auto"
     detail = look["detail"] if look.get("detail") is not None else (plan.get("auto_prompt") or {}).get("frames")
     side = number(look.get("side"))
     return {"motion": motion, "detail": number(detail), "side": max(224, min(4096, side)) if side else 0,
             "instruction": look["instruction"] if isinstance(look.get("instruction"), str) else "",
-            "writer": "brief" if look.get("writer") == "brief" else "full"}
+            "writer": "brief" if look.get("writer") == "brief" else "full",
+            "write_tokens": tokens(look.get("write_tokens"), *WRITE_TOKENS_RANGE),
+            "detail_tokens": tokens(look.get("detail_tokens"), *LOOK_TOKENS_RANGE),
+            "motion_tokens": tokens(look.get("motion_tokens"), *LOOK_TOKENS_RANGE)}
 
 
 def motion_frame_count(length: int, fps: float, motion) -> int:
@@ -2920,7 +2944,7 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
                     seg: dict, source: str = "guide", duration: float = 0.0, max_tokens: int = 2048,
                     cuts: list | None = None, template: str = "", style: str = "h3", source_facts: str | None = None, prompt_trigger: str = "motion_transfer",
                     keep_notes: list | None = None, carry_conditions: bool = False, full: bool = False,
-                    beats: str = "") -> str:
+                    beats: str = "", limit: int = 0) -> str:
     """One shot's prompt in H3's full-reference format, written by the VLM from key frames of the shot ([1,H,W,3] each,
     at `times` seconds into it), the shot's reference pictures (<Picture 1> first) with their descriptions, the user's
     request and the shot's Colored Marks, selection and mode. keep_notes (the user's kept picture descriptions) are
@@ -2932,7 +2956,10 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
     detailed_description is much shorter than `beats` (the motion notes the writer got) is asked for again
     (thin_description; not for a crop shot, whose prompt leaves out what is outside the crop). Of the two answers the
     one with fewer of the other problems is the prompt, as before; the second also when it has no problem the first
-    had not and a longer detailed_description. The caption style stays as it is. Without `full` nothing changes."""
+    had not and a longer detailed_description. The caption style stays as it is. Without `full` nothing changes.
+    limit (1.127.0), when above 0, is the most tokens an answer may have, as set by the user: it replaces the room
+    worked out from max_tokens (at least 1536, 2048 with `full`) and may be below it; the caption style keeps 512.
+    It is no word of the request."""
     nf, npics = len(frames), len(pictures)
     tt = ", ".join(_mmss(t) for t in times) if times else ""
     pics = ""
@@ -3032,7 +3059,8 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
     if carry_conditions:
         ask += ("\n\n" + AUTO_CONDITION_RULES + "\n"
                 + (AUTO_CONDITION_CAPTION if captions else AUTO_CONDITION_TEMPLATE if template else AUTO_CONDITION_H3))
-    tokens = 512 if captions else max(2048 if full else 1536, int(max_tokens))   # room for the fuller description
+    tokens = 512 if captions else int(limit) if int(limit or 0) > 0 else \
+        max(2048 if full else 1536, int(max_tokens))   # the user's limit, else room for the fuller description
     sampling = {"temperature": 0.6, "repetition_penalty": 1.1, "presence_penalty": 0.8}
     tidy = (lambda t: tidy_caption(t, seg, trigger)) if captions else \
         (lambda t: tidy_h3_prompt(t, seg, trigger, bool(cuts), npics, bool(template)))
@@ -3325,7 +3353,7 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
     same five keys under "motion" for the small frames (its answer as written), plus, only when they apply: "error"
     (the look failed: its message), "left_out" (how many sentences were not given to the writer: see untimed), "unused" (True: the writer got none of the motion notes), "again" ("used", "empty" or "failed": the
     key frames were then looked at again in full, and how that ended) and "again_error". "look" is what the looks
-    were made with (look_settings, with "writer", and the two notes as stored), for the panel's hint that they have
+    were made with (look_settings, with "writer" and the three token limits, and the two notes as stored), for the panel's hint that they have
     changed. "seen"
     and "look" are for the user to read: nothing reads them back, so they never date a prompt or change a stored
     shot's signature."""
@@ -3379,7 +3407,9 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
     guide = look_guidance(video_note, shot_note)
     # the large frames as read (their own aspect, no letterbox), as vlm_shot sends them: who, clothes, place, light and
     # the temporary conditions of the performance (tears, sweat...)
-    source_facts = str(vlm_generate(clip, SOURCE_QUESTION + guide, torch.cat(frames, 0), 1024) or "").strip()
+    detail_tokens = look["detail_tokens"] or DETAIL_TOKENS   # the answers' limits: the user's, else as before
+    motion_tokens = look["motion_tokens"] or MOTION_TOKENS
+    source_facts = str(vlm_generate(clip, SOURCE_QUESTION + guide, torch.cat(frames, 0), detail_tokens) or "").strip()
     times = [(int(x) - seg["start"]) / fps for x in picks]
     # kept with the written prompt and shown under it in the panel: a bad prompt can be told apart from a bad look
     seen = {"text": source_facts, "frames": len(frames), "width": int(frames[0].shape[2]),
@@ -3399,7 +3429,7 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
             frames_m = read(picks_m, side_m)
             motion.update(frames=len(frames_m), width=int(frames_m[0].shape[2]), height=int(frames_m[0].shape[1]),
                           times=[round(t, 2) for t in times_m])
-            motion["text"] = str(vlm_generate(clip, question, torch.cat(frames_m, 0), 768) or "").strip()
+            motion["text"] = str(vlm_generate(clip, question, torch.cat(frames_m, 0), motion_tokens) or "").strip()
         except Exception as exc:   # noqa: BLE001 - said in the console and kept with the prompt (seen.motion.error)
             if type(exc).__name__ == "InterruptProcessingException":   # Cancel stops the write, as everywhere else
                 raise
@@ -3427,7 +3457,8 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
                 picks_f = np.clip(np.array(full), 0, analysis["n"] - 1)
                 try:   # as optional as the motion look: the first look's notes are in hand
                     frames_f = read(picks_f, side_d)
-                    again = str(vlm_generate(clip, SOURCE_QUESTION + guide, torch.cat(frames_f, 0), 1024) or "").strip()
+                    again = str(vlm_generate(clip, SOURCE_QUESTION + guide, torch.cat(frames_f, 0),
+                                             detail_tokens) or "").strip()
                 except Exception as exc:   # noqa: BLE001 - said in the console and kept (seen.motion.again_error)
                     if type(exc).__name__ == "InterruptProcessingException":   # Cancel stops the write
                         raise
@@ -3457,11 +3488,12 @@ def auto_prompt_shot(clip, plan: dict, analysis: dict, path: str, seg: dict, nam
                            int(vcfg.get("max_tokens") or 1024), cut_times, tmpl,
                            ap.get("style") or "h3", source_facts=source_notes(source_facts, motion_notes, shot_note),
                            prompt_trigger=ap["trigger"], keep_notes=keep_lines, carry_conditions=True,
-                           full=look["writer"] == "full", beats=motion_notes)
+                           full=look["writer"] == "full", beats=motion_notes, limit=look["write_tokens"])
     return {"text": text, "for": written_prompt_for(plan, seg, names, instruction, template), "seen": seen,
             "look": {"motion": str(look["motion"]), "detail": look["detail"], "side": look["side"],
                      "video": look["instruction"], "shot": str(seg.get("look_note") or ""),
-                     "writer": look["writer"]}}
+                     "writer": look["writer"], "write_tokens": look["write_tokens"],
+                     "detail_tokens": look["detail_tokens"], "motion_tokens": look["motion_tokens"]}}
 
 
 PLACE_Q = ("This picture shows a place; the patch of black-and-white noise only hides a person, ignore it. Describe the "

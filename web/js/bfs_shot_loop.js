@@ -83,23 +83,34 @@ function motionSaid(look) {
 // 🤖 Auto prompt: what the looks at the source are made with now (bfs_shot_loop.look_settings and the two notes, as
 // auto_prompt_shot records them in a written prompt's `look`): the settings of plan.auto_look, with the Key frames
 // stored before 1.125.0 (auto_prompt.frames) until the new control is used, this shot's note, and how much of the
-// observations the writer puts into the prompt (writer: "full", or "brief" as before 1.126.0)
+// observations the writer puts into the prompt (writer: "full", or "brief" as before 1.126.0), and the most tokens
+// each answer may have (1.127.0: 0 = auto, else within the server's range). A limit is read as look_settings reads it:
+// a number (cut to a whole one) or a text of 1 to 9 digits and nothing else; all the rest is auto
+const tokenLimit = (v, lowest, highest) => {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.trunc(v)
+    : typeof v === "string" && /^[0-9]{1,9}$/.test(v) ? parseInt(v, 10) : 0;
+  return n > 0 ? Math.max(lowest, Math.min(highest, n)) : 0;
+};
 function lookNow(plan, note) {
   const L = plan.auto_look && typeof plan.auto_look === "object" ? plan.auto_look : {};
   return { motion: L.motion == null || L.motion === "" ? "auto" : String(L.motion),
            detail: (L.detail != null ? L.detail : plan.auto_prompt?.frames) || 0, side: parseInt(L.side) || 0,
            video: typeof L.instruction === "string" ? L.instruction : "", shot: typeof note === "string" ? note : "",
-           writer: L.writer === "brief" ? "brief" : "full" };
+           writer: L.writer === "brief" ? "brief" : "full",
+           write_tokens: tokenLimit(L.write_tokens, 256, 8192), detail_tokens: tokenLimit(L.detail_tokens, 128, 4096),
+           motion_tokens: tokenLimit(L.motion_tokens, 128, 4096) };
 }
 // true when a written prompt was made with other look settings or notes: a soft hint, never the "older" state (a
 // prompt written before 1.125.0 records none and gets no hint; one written with 1.125.0 records no `writer`, which
-// is then not compared: nothing the user set has changed)
+// is then not compared: nothing the user set has changed; one written before 1.127.0 records no token limit and
+// was written with them on auto, 0: a limit set since then is a change)
 function lookChanged(entry, plan, note) {
   const made = entry && typeof entry === "object" ? entry.look : null;
   if (!made || typeof made !== "object") return false;
   const now = lookNow(plan, note);
   return ["motion", "detail", "side", "video", "shot", "writer"].some(
-    k => (k !== "writer" || made.writer != null) && String(made[k] ?? "") !== String(now[k] ?? ""));
+    k => (k !== "writer" || made.writer != null) && String(made[k] ?? "") !== String(now[k] ?? ""))
+    || ["write_tokens", "detail_tokens", "motion_tokens"].some(k => String(made[k] ?? 0) !== String(now[k]));
 }
 
 const viewUrl = name => {
@@ -654,7 +665,8 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   // 🔒 use my prompt: the shot's written prompt is sent as written, never dated or rewritten
   const lockedOf = s => lockedPrompt(plan, segKey(s));
   const setAuto = (k, v) => { plan.auto_prompt = { ...plan.auto_prompt, [k]: v }; save(); };
-  // the looks at the source: Key frames, Motion frames, Key frame size and your instruction (plan.auto_look), and
+  // the looks at the source: Key frames, Motion frames, Key frame size, the answers' token limits and your
+  // instruction (plan.auto_look), and
   // your note about one shot's source (in the shot's own settings, so no write, edit, lock or run can lose it)
   const setLook = (k, v) => { plan.auto_look = { ...(plan.auto_look || {}), [k]: v }; save(); };
   const setLookNote = (i, v) => {

@@ -549,7 +549,7 @@ is written, and you can tell it what to look for.
   same number can cover other frames. The panel marks such a note in amber (*typed when this shot covered other
   frames*); check that it still fits, and edit it to confirm it.
 
-**Nothing here re-renders other shots.** Key frames, Motion frames, Key frame size, Shot description (1.126.0), the instruction and the notes are
+**Nothing here re-renders other shots.** Key frames, Motion frames, Key frame size, Shot description (1.126.0), the three max tokens (1.127.0), the instruction and the notes are
 kept apart from the settings a stored shot is checked against. Changing them never renders a stored shot again and
 never marks a prompt *older*, so no run rewrites a prompt because of them. They apply to prompts written after the
 change: click 🤖 Write again on the shots you want redone (a shot whose prompt text changes is rendered again, as
@@ -633,6 +633,36 @@ change. Prompts you already have keep their text; 🤖 Write them again to get t
 text changes is rendered again, as always). Longer prompts are not always better for the video model: if a shot
 follows the action worse with the full description, set *short* and write that shot again.
 
+**Answer limits (1.127.0):** three settings in the 🤖 Auto prompt card say how many tokens each answer of the VLM may
+have at most (a token is about three quarters of an English word):
+
+- **Prompt max tokens**: the prompt writer's answer. *auto* is 2048 (1536 with *Shot description* short), or the VLM
+  card's *Max tokens* when that is higher, as before; 1024 to 8192 is used as it is, also when it is lower than auto.
+  The short *caption* style keeps its 512.
+- **Key look max tokens**: the look at the key frames. *auto* is 1024, as before; 512 to 4096. The second look at the
+  key frames (when the motion look gave nothing usable) has the same limit.
+- **Motion look max tokens**: the look at the motion frames. *auto* is 768, as before; 512 to 4096.
+
+A limit is a ceiling, not a length to reach: an answer that fitted before is the same answer with a higher limit, and
+the writer's rules on length (a template's shot up to about 400 words) do not change with it. Raise one when its
+answer is **cut off**. Nothing in the panel says that an answer was cut, so this is what to look for:
+
+- a **look**: its notes under 👁 *What the VLM saw* stop in the middle of a sentence, or before the end of a long shot;
+- the **writer, with a template**: the written prompt stops in the middle of a sentence;
+- the **writer, six-section style**: harder to see, because the prompt is tidied. The cut sentence is usually dropped
+  and the prompt is closed with the stock lines *The ambient sound of the guide video continues throughout.* and *N/A*, so it
+  looks complete while its description ends before the shot does (the last observed beats are missing).
+
+A limit below auto saves time only when the VLM rambles, and makes a cut more likely (a description cut short can
+also be asked for again, at the same limit). A higher limit reserves a little more VLM memory before the answer
+starts, whatever its length (the VLM keeps room for the question plus the limit; for an 8B model about 0.15 GB per
+1000 tokens in bf16, twice that in fp32). Like the other look settings they never re-render a stored shot and never mark a prompt
+*older*: they apply to prompts written after the change, and a prompt written with other limits gets the grey *look
+settings or notes changed* line.
+
+The VLM card's own **Max tokens** is another matter: it limits *Analyse* and the picture descriptions, and it is part
+of every stored shot's signature, so changing it renders every stored shot again. Leave it alone for 🤖 Auto prompt.
+
 ### One description per picture (1.113.0)
 
 Descriptions are per picture: **📝 Describe refs** describes every picture the plan uses by itself, once per image
@@ -686,7 +716,7 @@ Every setting in the panel has a hover tooltip (ⓘ). The main ones:
 | Skipped shots in the output | keep the original video there or remove those shots |
 | Mask: padding / expand / feather / temporal expand / blockify | crop context, paste-back growth and softness, flicker hold, square blocks |
 | Mask: threshold / max objects / paste back | SAM 3 text matching, objects tracked, paste only the mask or the whole box |
-| VLM: frames per shot / max tokens / image max side | how much the VLM sees, its answer limit, and the longest side of images sent for analysis |
+| VLM: frames per shot / max tokens / image max side | how much the VLM sees, its answer limit, and the longest side of images sent for analysis (changing max tokens or image max side renders every stored shot again; 🤖 Auto prompt has its own answer limits) |
 
 ## One seed per shot: BFS Shot Seed (1.94.0)
 
